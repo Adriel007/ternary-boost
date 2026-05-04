@@ -139,6 +139,54 @@ def flexible_rounding(
     return T
 
 
+def structural_similarity_reorder(
+    w: torch.Tensor, block_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SSR: Reorder columns by similarity to form compact quantization blocks.
+
+    PT²-LLM Eq. 16 — efficient greedy clustering:
+      1. Compute the mean vector of remaining submatrix
+      2. Select top-k columns most similar to this mean (cosine similarity)
+      3. Those k columns form the next quantization block
+      4. Repeat for remaining columns
+
+    This is fully vectorized — no Python loops over columns.
+    """
+    out_f, in_f = w.shape
+    w_f = w.float()
+    col_norms = w_f.norm(dim=0).clamp_min(1e-8)  # [in_f]
+
+    mask = torch.ones(in_f, dtype=torch.bool, device=w.device)
+    perm_indices = []
+
+    for _ in range(0, in_f, block_size):
+        if not mask.any():
+            break
+        # Compute mean of remaining columns
+        w_remaining = w_f[:, mask]  # [out_f, n_remaining]
+        w_bar = w_remaining.mean(dim=1)  # [out_f]
+
+        # Cosine similarity of all remaining columns to w_bar
+        bar_norm = w_bar.norm().clamp_min(1e-8)
+        sim = (w_remaining.T @ w_bar) / (col_norms[mask] * bar_norm)  # [n_remaining]
+
+        # Take top-k most similar (or all if fewer than k remain)
+        k = min(block_size, sim.shape[0])
+        _, top_local = sim.topk(k)
+
+        # Map local indices back to global column indices
+        remaining_global = torch.where(mask)[0]
+        top_global = remaining_global[top_local]
+        perm_indices.append(top_global)
+        mask[top_global] = False
+
+    perm = torch.cat(perm_indices) if perm_indices else torch.arange(in_f, device=w.device)
+    inv_perm = torch.zeros(in_f, dtype=torch.long, device=w.device)
+    inv_perm[perm] = torch.arange(in_f, device=w.device)
+
+    return w[:, perm], inv_perm
+
+
 def iterative_ternary_fitting(
     w: torch.Tensor,
     config: PTBitNetConfig,
@@ -337,17 +385,23 @@ def apply_pt_bitnet(
             if calib_in is not None and torch.cuda.is_available():
                 calib_in = calib_in.cuda()
 
+                    # SSR: reorder columns for compact block distribution
+            w_reordered, inv_perm = structural_similarity_reorder(
+                w_quant, block_size=config.block_size,
+            )
+
             # Normalize before quantization
-            w_mean = w_quant.mean(dim=-1, keepdim=True)
-            w_std = w_quant.std(dim=-1, keepdim=True).clamp_min(1e-8)
-            w_norm = (w_quant - w_mean) / w_std
+            w_mean = w_reordered.mean(dim=-1, keepdim=True)
+            w_std = w_reordered.std(dim=-1, keepdim=True).clamp_min(1e-8)
+            w_norm = (w_reordered - w_mean) / w_std
             w_norm = w_norm.clamp(-config.outlier_clip_threshold, config.outlier_clip_threshold)
 
-            # PT²-LLM quantization
+            # PT²-LLM quantization on reordered weights
             ternary_w = ternary_quantize_vectorized(w_norm, config, calib_in)
 
-            # Denormalize
+            # Denormalize and reverse reordering
             ternary_w = ternary_w * w_std + w_mean
+            ternary_w = ternary_w[:, inv_perm]  # Undo column reordering
             ternary_w = ternary_w.to(device=device, dtype=module.weight.dtype)
 
             module.weight = nn.Parameter(ternary_w)
