@@ -257,30 +257,87 @@ def _replace_with_custom(model, custom_params, config, layer_cls, param_key):
 # ── Save with custom params ────────────────────────────────────────────
 
 def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
-    """Save model in bfloat16 with minimal peak memory.
+    """Save model as sharded safetensors to limit peak system RAM.
 
-    Converts the entire model to bfloat16 before extracting state_dict,
-    so all tensors are half-sized from the start. No intermediate copies.
-    Works on GPU, CPU, and memory-constrained environments (Colab 12 GB).
+    Tensors are iterated one at a time from named_parameters() (no full
+    state_dict in memory), converted to bf16, and saved in 1 GB shards.
+    HuggingFace from_pretrained loads sharded checkpoints natively via
+    the index file.
     """
     model.config.save_pretrained(str(cache_dir))
     tokenizer.save_pretrained(str(cache_dir))
 
-    # Convert model to bf16 in-place (halves memory before saving)
-    model = model.to(dtype=torch.bfloat16)
-
-    # state_dict now references bf16 tensors directly — no extra copies
-    state = model.state_dict()
-
-    standard_params = {k: v for k, v in state.items()
-                       if "weight_clip_val" not in k and "Lambada" not in k}
-    custom_params = {k: v for k, v in state.items()
-                     if "weight_clip_val" in k or "Lambada" in k}
-
     from safetensors.torch import save_file
-    save_file(standard_params, str(cache_dir / "model.safetensors"))
+
+    target_bytes = int(0.8 * 1024**3)  # 800 MB per shard
+    weight_map = {}
+    shard_batch = {}
+    shard_bytes = 0
+    shard_idx = 0
+    shard_files = []
+
+    def _flush_shard():
+        nonlocal shard_batch, shard_bytes, shard_idx
+        if not shard_batch:
+            return
+        name = f"model-{shard_idx + 1:05d}-of-XXXXX.safetensors"
+        path = str(cache_dir / name)
+        save_file(shard_batch, path)
+        shard_files.append((name, list(shard_batch.keys())))
+        shard_batch.clear()
+        shard_bytes = 0
+        shard_idx += 1
+
+    # Iterate tensors one at a time — no full state_dict in memory
+    custom_params = {}
+    for key, param in model.named_parameters():
+        tensor = param.detach().to(torch.bfloat16).cpu()
+        nbytes = tensor.numel() * tensor.element_size()
+
+        # Custom params saved separately (small, < 10 MB total)
+        if "weight_clip_val" in key or "Lambada" in key:
+            custom_params[key] = tensor
+            continue
+
+        shard_batch[key] = tensor
+        shard_bytes += nbytes
+        weight_map[key] = None
+
+        if shard_bytes >= target_bytes:
+            _flush_shard()
+            for fname, keys in shard_files[-1:]:
+                for k in keys:
+                    weight_map[k] = fname
+
+    _flush_shard()
+    for fname, keys in shard_files[-1:]:
+        for k in keys:
+            weight_map[k] = fname
+
+    # Save custom params as a single file (always small)
+    from safetensors.torch import save_file
     if custom_params:
         save_file(custom_params, str(cache_dir / "custom_params.safetensors"))
+
+    # Fix the "XXXXX" placeholder in shard filenames
+    total_shards = len(shard_files)
+    import os as _os
+    for old_name, keys in shard_files:
+        new_name = old_name.replace("XXXXX", f"{total_shards:05d}")
+        if old_name != new_name:
+            _os.rename(str(cache_dir / old_name), str(cache_dir / new_name))
+        for k in keys:
+            weight_map[k] = new_name
+
+    # Write index file (HuggingFace-compatible sharded checkpoint)
+    import json as _json
+    total_params = sum(p.numel() for p in model.parameters())
+    index = {
+        "metadata": {"total_size": total_params * 2},  # bf16 = 2 bytes
+        "weight_map": weight_map,
+    }
+    with open(str(cache_dir / "model.safetensors.index.json"), "w") as f:
+        _json.dump(index, f, indent=2)
 
 
 def _load_model_state(cache_dir: Path, entry: ModelEntry) -> tuple:
