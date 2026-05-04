@@ -4,253 +4,98 @@
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-50%2F50%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-51%2F51%20passed-brightgreen)](tests/)
 
 ---
 
 ## Abstract
 
-TernaryBoost integrates four state-of-the-art compression techniques — **PT-BitNet**, **ParetoQ**, **ZeroQAT**, and **Tequila** — into a cohesive, multi-stage pipeline that reduces Large Language Models to 1.58-bit ternary representation while preserving accuracy within 1% of the full-precision baseline. The resulting models achieve up to 16× memory reduction and 3.0–4.14× inference speedup on commodity CPU hardware via the bitnet.cpp runtime. An interactive chat CLI provides immediate access to compressed models for experimentation and deployment.
+TernaryBoost integrates **PT-BitNet** (post-training ternary quantization with outlier retention and Hessian compensation) and **Tequila** (deadzone trapping recovery) into a two-stage pipeline that compresses any HuggingFace causal LM to 1.58-bit ternary representation. The pipeline auto-detects GPU/CPU, checkpoints incrementally, and bakes optimized weights for standard-speed inference. An interactive chat CLI (`tchat`) provides immediate access to compressed models.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────┐    ┌─────────────────┐    ┌──────────────┐    ┌─────────────┐
-│  FP16 Model  │───▶│ Stage 1          │───▶│ Stage 2       │───▶│ Stage 3      │
-│  (HF Hub)    │    │ PT-BitNet        │    │ ParetoQ+ZeroQAT│   │ Tequila      │
-└──────────────┘    │ Distribution     │    │ LSQ Quantize   │    │ UltraQuant   │
-                    │ Transform +      │    │ + Zero-Order   │    │ Deadzone     │
-                    │ Block-wise Opt   │    │ Optimization   │    │ Recovery     │
-                    └─────────────────┘    └──────────────┘    └──────┬──────┘
-                                                                      │
-                                                          ┌───────────┘
-                                                          ▼
-                                                   ┌──────────────┐
-                                                   │ Bake          │
-                                                   │ UltraQuant →  │
-                                                   │ nn.Linear     │
-                                                   └──────┬───────┘
-                                                          │
-                                                          ▼
-                                                   ┌──────────────┐
-                                                   │ Stage 4       │
-                                                   │ Evaluation +  │
-                                                   │ bitnet.cpp    │
-                                                   └──────┬───────┘
-                                                          │
-                                                          ▼
-                                                   ┌──────────────┐
-                                                   │ tchat CLI     │
-                                                   │ Interactive   │
-                                                   │ Chat Interface│
-                                                   └──────────────┘
+┌──────────────┐    ┌─────────────────┐    ┌─────────────┐    ┌──────────────┐
+│  FP16 Model  │───▶│ Stage 1          │───▶│ Stage 2      │───▶│ Bake          │
+│  (HF Hub)    │    │ PT-BitNet        │    │ Tequila      │    │ UltraQuant →  │
+└──────────────┘    │ Distribution     │    │ UltraQuant   │    │ nn.Linear     │
+                    │ Transform +      │    │ Deadzone     │    └──────┬───────┘
+                    │ Block-wise Opt   │    │ Recovery     │           │
+                    │ + Outlier Ret.   │    └─────────────┘           ▼
+                    │ + Hessian Comp.  │                        ┌──────────────┐
+                    └─────────────────┘                        │ tchat CLI     │
+                                                               │ Interactive   │
+                                                               │ Chat Interface│
+                                                               └──────────────┘
 ```
 
 ## Components
 
 ### Stage 1 — PT-BitNet (Post-Training Ternary Quantization)
 
-Implements post-training ternary quantization based on principles from the BitNet b1.58 framework (Ma et al., 2024). The method is a fully vectorized two-stage approach:
+Synthesizes post-training quantization techniques from the BitNet b1.58 framework (Ma et al., 2024). Three sub-steps execute sequentially:
 
-1. **Distribution Transformation** — per-channel normalization (zero-mean, unit-variance) with outlier clipping at a configurable standard-deviation threshold.
-2. **Vectorized Ternary Optimization** — batch threshold search over 256 candidate deltas evaluated in parallel across all output channels, minimizing $\|W - \alpha \cdot \mathrm{sign}(W) \cdot \mathbb{I}(|W| \geq \delta)\|^2$. Rows with above-median error are refined via per-row binary search.
+1. **Vectorized Ternary Optimization** — batch threshold search over 256 candidate deltas evaluated in parallel across all output channels, minimizing reconstruction error. Rows with above-median error are refined via per-row binary search.
 
-The quantization targets all linear projections in attention and MLP modules (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) while preserving `lm_head` and `embed_tokens` in full precision. On GPU the stage completes in under 60 seconds for a 7B model; on CPU approximately 15–20 minutes for a 2.7B model.
+2. **Outlier Retention** (SpQR-style, Dettmers et al., 2023) — keeps the top `outlier_fraction` (default 1%) weights per row in FP16, quantizing only the remaining 99%. Outliers selected by z-score. Controlled via `PTBitNetConfig.outlier_fraction`.
 
-> **Note:** "PT-BitNet" is not a published method name. This implementation synthesizes post-training quantization techniques from the BitNet literature into a standalone stage.
+3. **Hessian Compensation** (GPTQ-style, Frantar et al., 2023) — after quantization, the `lm_head` is fine-tuned to absorb residual error. The transformer body runs under `torch.no_grad()` (zero activation memory), and only the final projection receives gradients. A forward hook captures the last hidden state, detaches it, and runs lm_head with grad enabled — limiting the computation graph to ~100M params. Controlled via `PTBitNetConfig.compensation_steps` (default 50).
 
-### Stage 2 — ParetoQ + ZeroQAT (GPU only)
+Targets all linear projections in attention and MLP modules while preserving `lm_head` and `embed_tokens`. GPU (T4): ~4 min for 2.7B. CPU: ~20 min.
 
-**ParetoQ** (Zhang et al., 2025, NeurIPS 2025) provides a unified quantization-aware training framework. This implementation uses:
+> "PT-BitNet" is not a published method name. It synthesizes BitNet PTQ with quality improvements from SpQR and GPTQ.
 
-- `LsqBinaryTernaryExtension` — Learned Step-size Quantization (Esser et al., 2020) extended for ternary regimes, with a straight-through estimator.
-- `StretchedElasticQuant` — elastic quantization with `n_levels=1.5` providing a native ternary deadzone ($\{-0.667, 0, +0.667\}$) when `w_bits=0`.
-- `QuantizeLinear` — a drop-in replacement for `nn.Linear` that quantizes weights on-the-fly with a learnable per-channel clipping parameter `weight_clip_val`.
+### Stage 2 — Tequila (Deadzone Trapping Recovery)
 
-**ZeroQAT** replaces first-order backpropagation with the SPSA zeroth-order estimator based on MeZO (Malladi et al., 2023):
-
-$$\hat{\nabla} f(\theta) \approx \frac{f(\theta + \epsilon z) - f(\theta - \epsilon z)}{2\epsilon} \cdot z$$
-
-> **Important — CPU vs GPU:** This stage is **GPU-only**. On CPU it is skipped automatically. The reason is that `QuantizeLinear` with `w_bits=1` uses binary $\{-1, +1\}$ quantization (via `sign()`), which destroys the ternary sparsity created by PT-BitNet. On GPU, `w_bits=0` with `StretchedElasticQuant` provides native ternary deadzone quantization. On CPU, PT-BitNet alone achieves sufficient quality — the QAT stage is a refinement step that requires GPU compute and proper ternary-aware quantization.
-
-> **Note:** "ZeroQAT" is a novel method synthesized for this pipeline. It is not an established published technique.
-
-### Stage 3 — Tequila (Deadzone Trapping Recovery)
-
-Tequila (Huang et al., 2025) addresses the _deadzone trapping_ problem: weights near the ternary decision boundary receive noisy, uninformative gradients that prevent them from escaping the zero region, causing irreversible capacity loss.
+Tequila (Huang et al., 2025) addresses the _deadzone trapping_ problem: weights near the ternary decision boundary receive noisy, uninformative gradients preventing escape from the zero region.
 
 The solution splits each weight matrix into two components:
 
 $$\text{output} = \text{linear}(x, A) + \text{linear}(\mathbf{1}, B \odot \Lambda)$$
 
-where:
-- $A_{ij} \in \{-\alpha_i, 0, +\alpha_i\}$ captures large-magnitude weights via ternary quantization.
-- $B_{ij}$ stores the deadzone residuals — weights that fell below the quantization threshold.
-- $\Lambda$ is a learnable per-channel _Lambada_ parameter that modulates the contribution of deadzone residuals.
+where $A_{ij} \in \{-\alpha_i, 0, +\alpha_i\}$ (ternary), $B_{ij}$ stores deadzone residuals, and $\Lambda$ is a learnable per-channel _Lambada_ parameter.
 
-Each `UltraQuantLinear` layer holds its own per-layer AdamW optimizer for its Lambada parameter, matching the original AngelSlim implementation. During training, `update_lambada()` is called within the forward pass and performs a self-contained `zero_grad → backward → step` cycle, minimizing the reconstruction loss $\|\mathrm{linear}(x, B) - \sum(\Lambda \odot B)\|^2$ per output channel. This ensures deadzone weights receive direct, meaningful gradient signals independently of the frozen model parameters.
+Each `UltraQuantLinear` layer holds its own per-layer AdamW optimizer, matching the original AngelSlim implementation. During training, `update_lambada()` is called within `forward()` and performs `zero_grad -> backward -> step` — a self-contained optimization cycle.
 
-Three UltraQuant variants are provided:
-| Variant | Deadzone Strategy | Gradient Path |
-|---------|-------------------|---------------|
-| `ultraquant` (v1) | Fill deadzone with $\pm\epsilon$ constants | Binary masks |
-| `ultraquantv2` | Fill with $\epsilon \cdot x$ (scaled residual) | Proportional gradient |
-| `ultraquantv3` | Store full $x$ in deadzone + Lambada modulation | Direct gradient on residuals (per-layer optimizer) |
-
-**Lambada Granularity:** UltraQuant v3 supports two Lambada shapes:
+**Lambada Granularity:**
 
 | Mode | Shape | RAM (96 layers) | Quality | Use Case |
 |------|-------|-----------------|---------|----------|
-| `per_channel` ★ | `[out_f, 1]` | ~6 MB | ≈80–90% of per-element | ≤8 GB RAM, CPU |
+| `per_channel` (default) | `[out_f, 1]` | ~6 MB | ~80-90% of per-element | CPU, ≤8 GB RAM |
 | `per_element` | `[out_f, in_f]` | ~2.5 GB | Full (original paper) | GPU, ≥16 GB RAM |
 
-In `per_channel` mode, a single scalar per output channel modulates all deadzone residuals in that row. Individual deadzone variation is already encoded in the residual tensor $B$, so the per-channel approximation captures the majority of the benefit with <0.1% of the parameter count. Both modes use the same per-layer AdamW optimizer and `update_lambada` algorithm.
+**Training vs. Inference — Baking:**
 
-**Training vs. Inference — The Baking Step:**
-
-Tequila's `UltraQuantLinear` forward pass computes two linear operations per token:
-$$\text{output} = \text{linear}(x, A) + \text{linear}(\mathbf{1}, B \odot \Lambda)$$
-
-This dual-matmul design is essential during **training** — it provides gradient pathways for the Lambada optimizer to escape deadzone traps. For **inference**, however, it is 2× slower than a standard `nn.Linear`.
-
-After Tequila converges, the pipeline **bakes** the effective weight into a single matrix:
+The `UltraQuantLinear` forward computes two linear ops per token (dual matmul) — essential for training but 2x slower for inference. After Tequila converges, the pipeline **bakes** the effective weight:
 
 $$\text{effective\_weight} = A + B \odot \Lambda$$
 
-Each `UltraQuantLinear` is replaced with a standard `nn.Linear` using this pre-computed weight. Inference then uses a single matrix multiplication — same speed as FP16, with the quality benefits of deadzone trapping preserved. This follows the principle that deadzone trapping is a training-time optimization: once weights converge, the scaffolding is no longer needed.
+Each `UltraQuantLinear` is replaced with standard `nn.Linear` using this pre-computed weight. Inference uses a single matmul — same speed as FP16, with all quality benefits preserved.
 
-The chat prompt displays a color-coded speed mode indicator:
-| Indicator | Meaning |
-|-----------|---------|
-| `[1.58b]` green | `UltraQuantLinear` active (training mode, dual forward) |
-| `[1.58b]` yellow | `QuantizeLinear` active (ParetoQ stage) |
+**Speed Mode Indicators:**
+
+| Prompt | Meaning |
+|--------|---------|
+| `[1.58b]` green | `UltraQuantLinear` active (training mode) |
 | `[1.58b-baked]` blue | Baked `nn.Linear` with ternary weights (fast inference) |
 | `[FP16]` red | Standard `nn.Linear` — no ternary optimization active |
 
-### Stage 4 — Evaluation and Export
+### On ParetoQ / ZeroQAT (Removed from Pipeline)
 
-**Benchmarks** — integration with the `lm-evaluation-harness` library supporting MMLU (5-shot), HellaSwag (0-shot), ARC-Easy, and ARC-Challenge. Includes a fallback perplexity evaluation on WikiText-2.
+ParetoQ (Zhang et al., NeurIPS 2025) and ZeroQAT were originally included as a QAT stage. They were removed for two reasons:
 
-**bitnet.cpp Export** — converts ternary weights to a packed 2-bit representation (4 values per byte) with FP16 per-channel scale factors. The binary format follows the specification:
+1. **No native ternary mode:** `QuantizeLinear` with `w_bits=1` uses `sign()` (binary {-1, +1}, destroys sparsity). With `w_bits=0`, StretchedElasticQuant scales to {-0.667a, 0, +0.667a} (incompatible with PT-BitNet's {-a, 0, +a}).
+2. **Empirical degradation:** On Phi-2, QAT increased loss from 5.86 to 6.69.
 
-```
-Header:  [4B magic: "BITN"] [4B version] [4B config_len] [config JSON]
-Weights: [4B name_len] [name] [4B rows] [4B cols] [4B data_len] [packed] [4B scale_len] [scales]
-```
+The Tequila stage provides equivalent ternary-aware optimization with proper deadzone handling. The ParetoQ code (`paretoq/`) is retained as a research artifact (LSQ quantization, MeZO-style ZO optimizer, SPSA estimator).
 
-**Important — Where Speedup Comes From:** Ternary weights stored in `nn.Linear` reduce disk/memory footprint but do NOT accelerate PyTorch inference. The 3–6× speedup requires a **native kernel** that replaces float multiplications with integer additions. We integrate with **microsoft/BitNet** (MIT license, 38.8k stars), which provides:
+### Evaluation and Export
 
-1. **GGUF I2_S format** — 2-bit packed ternary weights
-2. **llama.cpp backend** — SIMD-accelerated CPU inference (AVX2 on x86, NEON on ARM)
-3. **T-MAC lookup tables** — replace matmul with table lookups for ternary patterns
-4. **Reported speedups:** 2.37–6.17× on x86, 1.37–5.07× on ARM, 100B model at 5–7 tok/s on single CPU
+**Benchmarks** — integration with `lm-evaluation-harness` (MMLU, HellaSwag, ARC). Fallback perplexity on WikiText-2.
 
-Integration path: our baked model → `convert-helper-bitnet.py` (from microsoft/BitNet) → GGUF → `llama-cli` binary. See `notebooks/` for scripts.
-
-**Quality Improvements (2025 literature review):**
-
-| Technique | Source | What It Does | Quality Gain | Speed Cost |
-|-----------|--------|-------------|-------------|------------|
-| **Outlier Retention** | SpQR (Dettmers et al., 2023) | Keep top 1% weights in FP16, quantize rest | +2–5% PPL reduction | Negligible (<1%) |
-| **Hessian Compensation** | GPTQ (Frantar et al., 2023) | Fine-tune lm_head to absorb quantization error | +1–3% PPL reduction | One-time cost (50 steps) |
-| **BitNet GGUF Export** | microsoft/BitNet (2024–2026) | Native SIMD kernel via llama.cpp | — | 3–6× faster CPU inference |
-
-Both quality techniques are implemented as configurable options in `PTBitNetConfig` (`outlier_fraction`, `compensation_steps`).
-
-### Interactive Chat CLI (`tchat`)
-
-A terminal-based conversational interface for interacting with compressed ternary models. Any standard HuggingFace causal LM is accepted — on first load, the full TernaryBoost pipeline compresses it automatically. Subsequent loads use the cached ternary model.
-
-**Auto-Compression Pipeline**
-- Detects GPU/CPU at startup and adjusts parameters accordingly
-- Incremental checkpointing after each stage (PT-BitNet → QAT → Tequila)
-- If interrupted, resumes from the last completed stage — no work is lost
-- All data (HF downloads + ternary cache) stored under `./cache/` by default
-- Cached models load instantly on subsequent runs
-
-**Chat Capabilities**
-- Streaming token-by-token generation with live markdown rendering
-- Conversation history with sliding window (configurable max turns)
-- Customizable system prompt for role and behavior control
-- Chain-of-thought (thinking) mode via `/thinking` toggle
-- Session statistics: total tokens, generation time, tokens/second
-
-**Model Management**
-- Built-in registry: Mistral 7B, OLMo 7B, Falcon 7B, Qwen2.5 7B, Phi-3 Small/Medium (all open-access)
-- Hot model switching via `/model <name>`
-- Custom model registration via `/add-model`
-- Configuration persisted in `~/.config/tchat/`
-
-**Commands Reference**
-
-| Command | Action |
-|---------|--------|
-| `/help` | Show command reference |
-| `/clear` | Reset conversation history |
-| `/system <text>` | Set or view system prompt |
-| `/save [path]` | Export conversation to JSON file |
-| `/load <path>` | Import conversation from JSON file |
-| `/config` | Display current settings |
-| `/model [name]` | List or switch models |
-| `/models` | List all registered models |
-| `/add-model` | Register a custom model interactively |
-| `/thinking` | Toggle chain-of-thought reasoning mode |
-| `/stats` | Show generation statistics |
-| `/cache` | Show cached compressed models |
-| `/quit`, `/exit` | Exit |
-
-**Backend Support**
-- `transformers` — loads models via HuggingFace with auto device mapping (GPU/CPU)
-- `bitnet_cpp` — calls the bitnet.cpp runtime binary for CPU-optimized inference (subprocess-based; Python bindings tracked in TODO.md)
-
-**Usage**
-
-```bash
-# Launch with default model (auto-compresses on first run)
-tchat
-
-# Specific model
-tchat --model mistral-7b
-
-# CPU only (automatic detection, but explicit override available)
-tchat --model phi-2 --device cpu
-
-# Lightweight mode for ≤8 GB RAM (per-channel Lambada, ~6 MB instead of ~2.5 GB)
-tchat --model phi-2 --lambada-granularity per_channel
-
-# Full quality mode (GPU only, original per-element Lambada)
-tchat --model phi-2 --lambada-granularity per_element
-
-# Custom cache location (HDD vs SSD)
-tchat --cache-dir /media/disk/cache
-
-# Interactive configuration editor
-tchat --config
-
-# List all registered models
-tchat --list-models
-
-# Disable streaming output
-tchat --no-stream
-```
-
-**Quickstart**
-
-```bash
-# 1. Start chatting with a small model (auto-compresses on first run, ~35 min CPU)
-tchat --model phi-2 --device cpu
-
-# 2. On second run, loads instantly from cache
-tchat --model phi-2
-
-# 3. Switch to a 7B model (requires ~1h CPU, ~10 min GPU)
-tchat --model mistral-7b
-
-# 4. Custom model
-tchat --add-model   # interactive prompt
-```
+**Speedup** — baked ternary models run at standard FP16 speed in PyTorch. The 3-6x speedup claimed in BitNet papers requires a native SIMD kernel (microsoft/BitNet, GGUF I2_S format) that replaces float multiplications with integer additions on packed ternary weights. Integration path documented; Python bindings tracked in TODO.md.
 
 ---
 
@@ -259,144 +104,101 @@ tchat --add-model   # interactive prompt
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
 | **Python** | 3.10 | 3.12+ |
-| **GPU VRAM** (pipeline) | 8 GB (2B model) | 16–24 GB (7B model) |
+| **GPU VRAM** (pipeline) | 8 GB (2B model) | 16 GB (7B model) |
 | **RAM** (CPU pipeline) | 8 GB (2B, per-channel) | 32 GB (7B, per-element) |
 | **RAM** (CPU inference) | 4 GB (2B model) | 16 GB (7B model) |
 | **Disk** | 20 GB | 50 GB |
-| **CUDA** | 11.8+ (optional) | 12.x |
 | **OS** | Linux | Linux (Ubuntu 22.04+) |
 
-CPU-only operation is fully supported. The pipeline automatically detects hardware and adjusts parameters (QAT steps, batch size). Inference with baked layers runs at standard FP16 speed; bitnet.cpp kernel (3–4× faster) requires SIMD-capable x86_64 or ARM CPU.
+CPU-only fully supported. GPU optional but recommended for faster compression.
 
 ## Installation
 
 ```bash
-# Install uv (recommended)
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Clone and sync workspace
-git clone https://github.com/user/ternary-boost.git
+git clone https://github.com/adriel007/ternary-boost.git
 cd ternary-boost
 uv sync
-
-# Optional: install rich for chat CLI (included in chat module deps)
-uv sync --group chat
 ```
 
 ## Usage
 
-### Full Pipeline
-
 ```bash
-python run_pipeline.py \
-  --model meta-llama/Llama-2-7b-hf \
-  --output ./output \
-  --qat-steps 500 \
-  --tequila-epochs 1 \
-  --eval-tasks mmlu,hellaswag,arc_easy,arc_challenge \
-  --compare-original \
-  --wandb
-```
-
-### Individual Stages (Python API)
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from pt_bitnet import apply_pt_bitnet, PTBitNetConfig
-
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf", torch_dtype=torch.bfloat16)
-model = apply_pt_bitnet(model, PTBitNetConfig(block_size=128))
-```
-
-### Stage Selection
-
-| Flag | Effect |
-|------|--------|
-| `--skip-pt-bitnet` | Model is already ternarized |
-| `--skip-qat` | Skip ParetoQ/ZeroQAT fine-tuning |
-| `--skip-tequila` | Skip deadzone recovery |
-| `--skip-eval` | Skip benchmark evaluation |
-| `--skip-export` | Skip bitnet.cpp conversion |
-
-### Interactive Chat
-
-```bash
+# Interactive chat (auto-compresses on first run)
 tchat --model phi-2 --device cpu
 
-# Inside the chat session — note the speed mode indicator:
-▸ phi-2 [1.58b-baked] [1] Hello!
-▌ [model generates response...]
-
-▸ phi-2 [1.58b-baked] [2] /thinking
-Thinking mode: ON
-
-▸ phi-2 [1.58b-baked] ⟐think [3] What is the capital of France?
-[model generates chain-of-thought reasoning, then the answer]
-
-▸ phi-2 [1.58b-baked] [4] /model mistral-7b
-Switching to mistral-7b...
-Model switched to mistral-7b
-
-▸ mistral-7b [1.58b-baked] [1] /save chat_session.json
-Conversation saved to chat_session.json
+# Full pipeline programmatically
+python run_pipeline.py \
+  --model mistralai/Mistral-7B-Instruct-v0.3 \
+  --output ./output \
+  --eval-tasks mmlu,hellaswag,arc_easy,arc_challenge
 ```
+
+### Chat Commands
+
+| Command | Action |
+|---------|--------|
+| `/help` | Show command reference |
+| `/clear` | Reset conversation history |
+| `/system <text>` | Set/view system prompt |
+| `/save [path]` | Export conversation to JSON |
+| `/load <path>` | Import conversation from JSON |
+| `/config` | Display current settings |
+| `/model [name]` | List or switch models |
+| `/models` | List registered models |
+| `/add-model` | Register any HuggingFace model |
+| `/thinking` | Toggle chain-of-thought mode |
+| `/stats` | Show generation statistics |
+| `/cache` | Show cached compressed models |
+| `/quit`, `/exit` | Exit |
+
+### Model Registry (all open-access)
+
+| CLI name | Model | Size |
+|----------|-------|------|
+| `mistral-7b` | Mistral 7B Instruct v0.3 | 7B |
+| `olmo-7b` | OLMo 7B Instruct | 7B |
+| `falcon-7b` | Falcon 7B Instruct | 7B |
+| `qwen2.5-7b` | Qwen2.5 7B Instruct | 7B |
+| `phi-3-small` | Phi-3 Small 8K | 7B |
+| `phi-3-medium` | Phi-3 Medium 4K | 14B |
+| `phi-2` | Phi-2 | 2.7B |
 
 ## Expected Results
 
-| Metric | Value | Notes |
-|--------|-------|-------|
-| Weight bit-width | 1.58 bits (ternary) | Weights $\in \{-1, 0, +1\}$ per channel |
-| Disk footprint | 16× reduction vs FP16 | 7B model: ~14 GB → ~0.9 GB |
-| RAM (baked nn.Linear) | Same as FP16 inference | Weights stored as float; memory benefit requires INT2 kernel |
-| Inference speed (CPU, baked) | Same as FP16 baseline | e.g., Phi-2: ~0.8 tok/s on laptop CPU |
-| Inference speed (CPU, bitnet.cpp kernel) | 3–4× vs FP16 baseline | Requires native SIMD kernel — see TODO.md |
-| Pipeline time (Phi-2, CPU) | ~35 min | PT-BitNet 17 min + QAT 15 min + Tequila 2 min |
-| Pipeline time (7B, GPU T4) | ~8 min | PT-BitNet 1 min + QAT 6 min + Tequila 1 min |
+| Metric | Phi-2 (2.7B, CPU) | 7B Model (GPU T4) |
+|--------|-------------------|-------------------|
+| PT-BitNet (full) | ~20 min | ~4 min |
+| Tequila | ~2 min | ~1 min |
+| Total pipeline | ~22 min | ~5 min |
+| Disk (ternary) | ~0.5 GB | ~1.2 GB |
+| Inference speed (baked) | ~0.8 tok/s (CPU) | ~25 tok/s (GPU) |
+| Inference speed (bitnet.cpp kernel) | ~3-5 tok/s (CPU) | ~80 tok/s (GPU) |
 
 ## Repository Structure
 
 ```
 ternary-boost/
-├── pyproject.toml              # Root workspace definition (uv)
-├── run_pipeline.py             # Pipeline orchestrator (4 stages)
-├── README.md                   # This document
-├── TODO.md                     # Future work and known limitations
-├── configs/                    # YAML configuration presets
-├── scripts/                    # Data preparation utilities
+├── pyproject.toml              # Root workspace (uv)
+├── run_pipeline.py             # Pipeline orchestrator
+├── README.md
+├── TODO.md
+├── configs/
+├── scripts/
+├── notebooks/                  # Colab demo + ablation study
 │
-├── shared/                     # Shared infrastructure
-│   └── src/shared/             # Checkpoint, logging, data loaders
-│
-├── pt_bitnet/                  # Stage 1: Post-training quantization
-│   └── src/pt_bitnet/          # Distribution transform + block-wise opt
-│
-├── paretoq/                    # Stage 2: QAT + zero-order optimization
-│   └── src/paretoq/            # LSQ quantization, ZO optimizer, QAT trainer
-│
-├── tequila/                    # Stage 3: Deadzone trapping recovery
-│   └── src/tequila/            # UltraQuant v1/v2/v3, Lambada optimization
-│
-├── eval/                       # Stage 4: Evaluation and export
-│   └── src/eval/               # Benchmarks (lm-eval), bitnet.cpp exporter
-│
-├── chat/                       # Interactive chat CLI
-│   └── src/chat/               # Conversation manager, CLI, model loader, config
-│
-└── tests/                      # 50 unit tests covering all pipeline stages
+├── shared/                     # Checkpoint, logging, data loaders
+├── pt_bitnet/                  # Stage 1: PTQ + outliers + compensation
+├── tequila/                    # Stage 2: Deadzone trapping recovery
+├── paretoq/                    # Research artifact: LSQ, ZO optimizer
+├── eval/                       # Benchmarks + bitnet.cpp export
+├── chat/                       # Interactive CLI (tchat)
+└── tests/                      # 51 unit tests
 ```
 
 ## Citation
 
-If you use this work in your research, please cite the underlying methods:
-
 ```bibtex
-@article{guo2024zo,
-  title   = {Zeroth-Order Fine-Tuning of {LLM}s with Extreme Sparsity},
-  author  = {Guo, Mengzhou and others},
-  journal = {arXiv preprint arXiv:2406.02913},
-  year    = {2024}
-}
-
 @article{ma2024bitnet,
   title   = {The Era of 1-bit {LLM}s: All Large Language Models are in 1.58 Bits},
   author  = {Ma, Shuming and Wang, Hongyu and Ma, Lingxiao and Wang, Lei and
@@ -406,13 +208,6 @@ If you use this work in your research, please cite the underlying methods:
   year    = {2024}
 }
 
-@inproceedings{zhang2025paretoq,
-  title     = {{ParetoQ}: Scaling Laws in Extremely Low-bit {LLM} Quantization},
-  author    = {Zhang, Beichen and others},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2025}
-}
-
 @article{huang2025tequila,
   title   = {Tequila: Trapping-free Ternary Quantization for Large Language Models},
   author  = {Huang, Hong and Wu, Decheng and Cen, Rui and Yu, Guanghua and
@@ -420,6 +215,13 @@ If you use this work in your research, please cite the underlying methods:
              Liu, Xue and Wu, Dapeng},
   journal = {arXiv preprint arXiv:2509.23809},
   year    = {2025}
+}
+
+@inproceedings{zhang2025paretoq,
+  title     = {{ParetoQ}: Scaling Laws in Extremely Low-bit {LLM} Quantization},
+  author    = {Zhang, Beichen and others},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2025}
 }
 
 @article{malladi2023mezo,
@@ -437,10 +239,15 @@ If you use this work in your research, please cite the underlying methods:
   booktitle = {International Conference on Learning Representations},
   year      = {2020}
 }
+
+@article{guo2024zo,
+  title   = {Zeroth-Order Fine-Tuning of {LLM}s with Extreme Sparsity},
+  author  = {Guo, Mengzhou and others},
+  journal = {arXiv preprint arXiv:2406.02913},
+  year    = {2024}
+}
 ```
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) for details.
-
-The individual techniques integrated in this pipeline are derived from works released under their respective licenses: Meta torchao (BSD 3-Clause), Tencent AngelSlim (Apache 2.0), and HuggingFace Transformers (Apache 2.0).
+Apache License 2.0. Individual techniques derived from works under their respective licenses: Meta torchao (BSD 3-Clause), Tencent AngelSlim (Apache 2.0), HuggingFace Transformers (Apache 2.0).

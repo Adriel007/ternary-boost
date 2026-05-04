@@ -1,9 +1,12 @@
 """PT-BitNet: Post-Training Ternary Quantization for LLMs.
 
-Vectorized two-stage approach:
-  1. Distribution Transform — per-channel normalization + outlier clipping.
-  2. Block-wise Ternary Optimization — fully vectorized per-channel
-     threshold search minimizing reconstruction error ||W - alpha·T(W,δ)||².
+Mathematical foundation from PT²-LLM (Yan et al., ICLR 2026):
+  Asymmetric Ternary Quantizer with closed-form Iterative Ternary Fitting (ITF)
+  and Activation-aware Grid Alignment (AGA).
+
+Quality improvements from:
+  SpQR (Dettmers et al., 2023) — outlier retention
+  GPTQ (Frantar et al., 2023)   — Hessian compensation via lm_head fine-tuning
 """
 
 from dataclasses import dataclass, field
@@ -20,13 +23,18 @@ logger = get_logger("pt_bitnet")
 
 @dataclass
 class PTBitNetConfig:
-    bit_width: float = 1.58
+    """Configuration for post-training ternary quantization."""
+    # Core ternary parameters
+    asymmetric: bool = True            # Asymmetric grid {-α+μ, μ, +α+μ} (PT²-LLM)
+    itf_iterations: int = 10           # Iterative Ternary Fitting steps
     block_size: int = 128
+    # Quality improvements
+    outlier_fraction: float = 0.01     # Top-k% weights kept in FP16 (SpQR)
+    compensation_steps: int = 50       # Hessian compensation on lm_head (GPTQ)
+    # Legacy
     outlier_clip_threshold: float = 3.0
     max_iter: int = 10
     tolerance: float = 1e-4
-    outlier_fraction: float = 0.01  # top 1% weights kept in FP16 (SpQR-style)
-    compensation_steps: int = 50    # Hessian compensation iterations on lm_head
     target_modules: tuple = field(
         default=(
             "q_proj", "k_proj", "v_proj", "o_proj",
@@ -37,7 +45,9 @@ class PTBitNetConfig:
     show_progress: bool = True
 
 
-def _find_quantizable_linears(model: nn.Module, config: PTBitNetConfig) -> list[tuple[str, nn.Linear]]:
+def _find_quantizable_linears(
+    model: nn.Module, config: PTBitNetConfig
+) -> list[tuple[str, nn.Linear]]:
     targets = []
     for module_name, module in model.named_modules():
         if isinstance(module, nn.Linear):
@@ -49,18 +59,170 @@ def _find_quantizable_linears(model: nn.Module, config: PTBitNetConfig) -> list[
     return targets
 
 
+# ═══════════════════════════════════════════════════════════════════
+# PT²-LLM: Asymmetric Ternary Quantizer with ITF + AGA
+# ═══════════════════════════════════════════════════════════════════
+
+def asymmetric_ternary_init(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Initialize asymmetric ternary parameters (α, μ, T).
+
+    Following PT²-LLM Eq. 4-5:
+      μ = row-wise mean of W
+      Δ = 0.75 * mean(|W - μ|) per row  (TWN threshold approximation)
+      α = weighted mean of active weights
+      T initialized via threshold Δ on centered weights
+    """
+    out_f = w.shape[0]
+    mu = w.mean(dim=-1, keepdim=True)       # [out_f, 1]
+    w_centered = w - mu
+
+    # TWN threshold: Δ = 0.75 * mean(|w_centered|)
+    delta = 0.75 * w_centered.abs().mean(dim=-1, keepdim=True)  # [out_f, 1]
+
+    # Initialize T via threshold
+    T = torch.zeros_like(w)
+    T[w_centered > delta] = 1.0
+    T[w_centered < -delta] = -1.0
+
+    # Initialize α via TWN closed form (Eq. 5)
+    num = (T * w_centered).sum(dim=-1)          # [out_f]
+    den = T.abs().sum(dim=-1).clamp_min(1)      # [out_f]
+    alpha = (num / den).unsqueeze(-1)            # [out_f, 1]
+
+    return alpha, mu, T
+
+
+def build_optimal_grid(
+    T: torch.Tensor, w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Closed-form optimal grid parameters (α*, μ*) given fixed T.
+
+    PT²-LLM Eq. 9, vectorized across all rows:
+      α* = [m·(W⊙T)1 - (T1)⊙(W1)] / [m·(T⊙T)1 - (T1)²]
+      μ* = [(T⊙T)1⊙(W1) - (T1)⊙((W⊙T)1)] / [m·(T⊙T)1 - (T1)²]
+
+    All operations are batched across output features.
+    """
+    m = w.shape[1]  # number of columns
+    WoT = w * T           # element-wise
+    ToT = T * T           # element-wise (T ⊙ T)
+
+    sum_WoT = WoT.sum(dim=-1)       # [out_f]
+    sum_ToT = ToT.sum(dim=-1)       # [out_f]
+    sum_T = T.sum(dim=-1)           # [out_f]
+    sum_W = w.sum(dim=-1)           # [out_f]
+
+    denom = m * sum_ToT - sum_T * sum_T   # [out_f]
+    denom = denom.clamp_min(1e-8)
+
+    alpha = (m * sum_WoT - sum_T * sum_W) / denom          # [out_f]
+    mu = (sum_ToT * sum_W - sum_T * sum_WoT) / denom       # [out_f]
+
+    return alpha.unsqueeze(-1), mu.unsqueeze(-1)           # [out_f, 1]
+
+
+def flexible_rounding(
+    w: torch.Tensor, alpha: torch.Tensor, mu: torch.Tensor,
+) -> torch.Tensor:
+    """Optimal ternary assignment given grid (α, μ).
+
+    PT²-LLM Eq. 10:
+      Z_ij = (W_ij - μ_i) / α_i
+      T*_ij = argmin_{t∈{-1,0,1}} |Z_ij - t|
+    """
+    z = (w - mu) / (alpha.clamp_min(1e-8))     # [out_f, in_f]
+    T = torch.zeros_like(w)
+    T[z > 0.5] = 1.0
+    T[z < -0.5] = -1.0
+    return T
+
+
+def iterative_ternary_fitting(
+    w: torch.Tensor,
+    config: PTBitNetConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ITF: alternate between grid optimization and ternary rounding.
+
+    PT²-LLM Algorithm 1:
+      1. Initialize α, μ, T
+      2. Repeat until T stabilizes:
+         a. Build optimal grid (α, μ) given T (Eq. 9)
+         b. Flexible rounding T given (α, μ) (Eq. 10)
+      3. Return converged (α, μ, T)
+
+    Converges in ~10 iterations. Each step is closed-form — no gradients.
+    """
+    alpha, mu, T = asymmetric_ternary_init(w)
+
+    for _ in range(config.itf_iterations):
+        T_prev = T.clone()
+        alpha, mu = build_optimal_grid(T, w)
+        T = flexible_rounding(w, alpha, mu)
+        if torch.equal(T, T_prev):
+            break
+
+    return alpha, mu, T
+
+
+def activation_aware_grid_alignment(
+    w: torch.Tensor,
+    T: torch.Tensor,
+    X: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AGA: refine grid parameters to minimize output error.
+
+    PT²-LLM Eq. 13:
+      Minimizes ||WX - (αT+μ)X||² instead of ||W - (αT+μ)||².
+      Uses calibration activations X to align quantized outputs.
+
+    If X is None, returns the weight-space optimal (α, μ) from build_optimal_grid.
+    """
+    if X is None:
+        return build_optimal_grid(T, w)
+
+    # Compute activation covariance S = sum over batch of X_b X_b^T
+    # X shape: [B, L, m] → reshape to [B*L, m]
+    X_flat = X.reshape(-1, X.shape[-1]).float()  # [B*L, m]
+    S = X_flat.T @ X_flat  # [m, m]
+
+    m = w.shape[1]
+    ones = torch.ones(m, 1, device=w.device, dtype=torch.float32)
+    T_float = T.float()
+    w_float = w.float()
+
+    # PT²-LLM Eq. 13 (vectorized)
+    d = (ones.T @ S @ ones).squeeze()            # scalar
+    v = (T_float @ S @ ones).squeeze(-1)         # [out_f]
+
+    WoT = w_float * T_float
+    T2 = T_float * T_float
+
+    sum_WoT_S1 = (WoT @ S @ ones).squeeze(-1)    # [out_f]
+    sum_WS1 = (w_float @ S @ ones).squeeze(-1)    # [out_f]
+    sum_T2_S1 = (T2 @ S @ ones).squeeze(-1)       # [out_f]
+
+    denom = d * sum_T2_S1 - v * v                 # [out_f]
+    denom = denom.clamp_min(1e-8)
+
+    alpha = (d * sum_WoT_S1 - v * sum_WS1) / denom
+    mu = (sum_T2_S1 * sum_WS1 - v * sum_WoT_S1) / denom
+
+    return alpha.unsqueeze(-1), mu.unsqueeze(-1)
+
+
 def ternary_quantize_vectorized(
     weight: torch.Tensor,
     config: PTBitNetConfig,
+    calibration_inputs: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Vectorized ternary quantization with outlier retention (SpQR-style).
+    """Full PT²-LLM quantization pipeline: ITF + AGA + Outlier Retention.
 
-    1. Identifies top-k% outlier weights per row (by magnitude/sensitivity).
-    2. Keeps outliers in their original precision.
-    3. Quantizes remaining weights to ternary {-alpha, 0, +alpha}.
-
-    Outlier retention preserves critical weights that would cause large
-    quantization errors, trading <k% density for significant quality gain.
+    1. Identify and preserve outliers (SpQR-style)
+    2. Run ITF on non-outlier weights → converged (α, μ, T)
+    3. Run AGA with calibration inputs → refined (α, μ)
+    4. Merge: outliers kept FP16, rest quantized to {-α+μ, μ, +α+μ}
     """
     w = weight.float()
     out_f, in_f = w.shape
@@ -68,42 +230,55 @@ def ternary_quantize_vectorized(
     # --- Outlier identification (SpQR-style) ---
     if config.outlier_fraction > 0:
         w_abs = w.abs()
-        # Per-row z-score: how far each weight is from its row's distribution
         row_mean = w_abs.mean(dim=-1, keepdim=True)
         row_std = w_abs.std(dim=-1, keepdim=True).clamp_min(1e-8)
-        outlier_score = (w_abs - row_mean) / row_std  # [out_f, in_f]
-
+        outlier_score = (w_abs - row_mean) / row_std
         k = max(1, int(in_f * config.outlier_fraction))
-        _, outlier_idx = outlier_score.topk(k, dim=-1)  # [out_f, k]
-
+        _, outlier_idx = outlier_score.topk(k, dim=-1)
         outlier_mask = torch.zeros_like(w, dtype=torch.bool)
         outlier_mask.scatter_(-1, outlier_idx, True)
     else:
         outlier_mask = torch.zeros_like(w, dtype=torch.bool)
 
-    # --- Quantize non-outliers to ternary ---
-    w_to_quantize = w.clone()
-    w_to_quantize[outlier_mask] = 0  # Zero out outliers for quantization
+    # --- ITF on non-outlier weights ---
+    w_quant = w.clone()
+    w_quant[outlier_mask] = 0  # Zero out outliers temporarily
 
-    w_abs = w_to_quantize.abs()
-    w_sign = w.sign()  # Use sign of original weights
+    if config.asymmetric:
+        alpha, mu, T = iterative_ternary_fitting(w_quant, config)
 
-    # Sort absolute values per row
-    w_abs_sorted, sort_idx = w_abs.sort(dim=-1)
-    w_sign_sorted = w_sign.gather(-1, sort_idx)
+        # --- AGA: refine grid with calibration inputs ---
+        if calibration_inputs is not None:
+            alpha, mu = activation_aware_grid_alignment(w_quant, T, calibration_inputs)
 
-    n_candidates = min(in_f, 256)
-    if in_f > n_candidates:
-        step = max(1, in_f // n_candidates)
-        candidate_indices = torch.arange(0, in_f, step, device=w.device)
+        # Reconstruct: Ŵ = αT + μ
+        reconstructed = alpha * T + mu
     else:
-        candidate_indices = torch.arange(in_f, device=w.device)
+        # Symmetric fallback (legacy)
+        reconstructed = _symmetric_ternary(w_quant, config)
 
+    # Merge outliers back
+    reconstructed[outlier_mask] = w[outlier_mask]
+
+    return reconstructed
+
+
+def _symmetric_ternary(
+    w: torch.Tensor, config: PTBitNetConfig,
+) -> torch.Tensor:
+    """Symmetric ternary fallback: {-α, 0, +α}."""
+    out_f, in_f = w.shape
+    w_abs = w.abs()
+    w_sign = w.sign()
+
+    w_abs_sorted, _ = w_abs.sort(dim=-1)
+    n_candidates = min(in_f, 256)
+    step = max(1, in_f // n_candidates)
+    candidate_indices = torch.arange(0, in_f, step, device=w.device)
     candidate_deltas = w_abs_sorted[:, candidate_indices]
 
     best_error = torch.full((out_f,), float("inf"), device=w.device)
-    best_alpha = torch.zeros(out_f, device=w.device)
-    best_ternary = torch.zeros_like(w)
+    best_result = torch.zeros_like(w)
 
     for j in range(candidate_indices.size(0)):
         delta = candidate_deltas[:, j:j+1]
@@ -111,51 +286,143 @@ def ternary_quantize_vectorized(
         active_count = active.sum(dim=-1).clamp_min(1)
         alpha = (w_abs * active.float()).sum(dim=-1) / active_count
         recon = torch.where(active, alpha.unsqueeze(-1) * w_sign, torch.zeros_like(w))
-        error = ((w_to_quantize - recon) ** 2).sum(dim=-1)
-
+        error = ((w - recon) ** 2).sum(dim=-1)
         improve = error < best_error
         best_error = torch.where(improve, error, best_error)
-        best_alpha = torch.where(improve, alpha, best_alpha)
-        best_ternary = torch.where(
-            improve.unsqueeze(-1), recon, best_ternary,
-        )
+        best_result = torch.where(improve.unsqueeze(-1), recon, best_result)
 
-    # Refine worst rows
-    needs_refine = best_error > best_error.median() * 1.5
-    if needs_refine.any():
-        for idx in torch.where(needs_refine)[0]:
-            w_row = w_to_quantize[idx]
-            w_abs_row = w_abs[idx]
-            w_sign_row = w_sign[idx]
-            delta = candidate_deltas[idx, candidate_deltas[idx] > 0].min().item() if (candidate_deltas[idx] > 0).any() else w_abs_row.max().item() * 0.5
+    return best_result
 
-            for _ in range(config.max_iter):
-                active = w_abs_row >= delta
-                if active.sum() == 0:
-                    delta *= 0.5
-                    continue
-                alpha = w_abs_row[active].mean()
-                recon = torch.where(active, alpha * w_sign_row, torch.zeros_like(w_row))
-                error = ((w_row - recon) ** 2).sum()
-                above = w_abs_row[w_abs_row >= delta]
-                below = w_abs_row[w_abs_row < delta]
-                if below.numel() > 0:
-                    delta_new_val = below.max().item()
-                else:
-                    delta_new_val = delta * 0.5
-                if delta_new_val == 0 or abs(delta_new_val - delta) < config.tolerance:
-                    break
-                delta = delta_new_val
 
-            if error < best_error[idx]:
-                best_ternary[idx] = recon
+# ═══════════════════════════════════════════════════════════════════
+# Main entry point
+# ═══════════════════════════════════════════════════════════════════
 
-    # Merge: outliers kept as-is, rest quantized to ternary
-    result = best_ternary.clone()
-    result[outlier_mask] = w[outlier_mask]
+def apply_pt_bitnet(
+    model: PreTrainedModel,
+    config: Optional[PTBitNetConfig] = None,
+    tokenizer=None,
+    calibration_texts: Optional[list[str]] = None,
+) -> PreTrainedModel:
+    """Apply PT-BitNet post-training ternary quantization.
 
-    return result
+    Uses PT²-LLM asymmetric ternary quantizer with ITF + AGA.
+    Optionally applies Hessian compensation on lm_head.
+    """
+    if config is None:
+        config = PTBitNetConfig()
 
+    logger.info("Starting PT-BitNet (PT²-LLM asymmetric ternary quantizer)...")
+    if config.asymmetric:
+        logger.info("  Mode: Asymmetric {-α+μ, μ, +α+μ} with ITF + AGA")
+    if config.outlier_fraction > 0:
+        logger.info(f"  Outlier retention: {config.outlier_fraction*100:.1f}% FP16")
+
+    model.eval()
+    targets = _find_quantizable_linears(model, config)
+
+    # Prepare calibration activations for AGA (if possible)
+    calibration_acts = _collect_activations(model, tokenizer, calibration_texts, config)
+
+    with torch.no_grad():
+        for i, (name, module) in enumerate(targets):
+            w = module.weight.data
+            device = w.device
+
+            # Move to GPU for speed if available
+            w_quant = w.cuda() if torch.cuda.is_available() else w
+
+            # Get calibration inputs for this layer (for AGA)
+            calib_in = calibration_acts.get(name) if calibration_acts else None
+            if calib_in is not None and torch.cuda.is_available():
+                calib_in = calib_in.cuda()
+
+            # Normalize before quantization
+            w_mean = w_quant.mean(dim=-1, keepdim=True)
+            w_std = w_quant.std(dim=-1, keepdim=True).clamp_min(1e-8)
+            w_norm = (w_quant - w_mean) / w_std
+            w_norm = w_norm.clamp(-config.outlier_clip_threshold, config.outlier_clip_threshold)
+
+            # PT²-LLM quantization
+            ternary_w = ternary_quantize_vectorized(w_norm, config, calib_in)
+
+            # Denormalize
+            ternary_w = ternary_w * w_std + w_mean
+            ternary_w = ternary_w.to(device=device, dtype=module.weight.dtype)
+
+            module.weight = nn.Parameter(ternary_w)
+            module.weight.requires_grad = False
+
+            if config.show_progress and (i + 1) % max(1, len(targets) // 10) == 0:
+                logger.info(f"  PT-BitNet: {i + 1}/{len(targets)} layers "
+                            f"({100 * (i + 1) // len(targets)}%)")
+
+    logger.info(f"PT-BitNet complete: {len(targets)} layers quantized")
+
+    # Optional: Hessian compensation on lm_head
+    if config.compensation_steps > 0 and tokenizer is not None and calibration_texts is not None:
+        hessian_compensation(model, tokenizer, calibration_texts, config)
+
+    return model
+
+
+def _collect_activations(
+    model: PreTrainedModel,
+    tokenizer,
+    calibration_texts: Optional[list[str]],
+    config: PTBitNetConfig,
+) -> Optional[dict[str, torch.Tensor]]:
+    """Collect calibration activations for AGA.
+
+    Runs a single forward pass on calibration data and captures the
+    input to each quantizable linear layer.
+    """
+    if tokenizer is None or calibration_texts is None or len(calibration_texts) == 0:
+        return None
+
+    logger.info("  Collecting calibration activations for AGA...")
+    acts = {}
+
+    def _make_hook(layer_name):
+        def _hook(module, input, output):
+            if isinstance(input, tuple):
+                acts[layer_name] = input[0].detach()
+            else:
+                acts[layer_name] = input.detach()
+        return _hook
+
+    handles = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if any(skip in module_name for skip in config.skip_modules):
+                continue
+            if any(t in module_name for t in config.target_modules):
+                handles.append(module.register_forward_hook(_make_hook(module_name)))
+
+    # Run one batch through the model
+    has_cuda = torch.cuda.is_available()
+    text = calibration_texts[0] if calibration_texts else "Hello world"
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=64)
+    input_ids = inputs["input_ids"]
+    if has_cuda:
+        input_ids = input_ids.cuda()
+
+    with torch.no_grad():
+        try:
+            model(input_ids=input_ids)
+        except Exception:
+            pass  # Some layers might fail due to dtype issues
+
+    for h in handles:
+        h.remove()
+
+    logger.info(f"  Collected activations for {len(acts)} layers")
+    return acts if acts else None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Hessian Compensation (unchanged)
+# ═══════════════════════════════════════════════════════════════════
 
 def hessian_compensation(
     model: PreTrainedModel,
@@ -163,20 +430,11 @@ def hessian_compensation(
     calibration_texts: list[str],
     config: PTBitNetConfig,
 ) -> None:
-    """Compensate quantization error by fine-tuning lm_head (Hessian-style).
-
-    Memory-efficient design:
-      transformer body → runs under torch.no_grad() (zero activation memory)
-      hidden_states     → detached from graph
-      lm_head           → only module with requires_grad=True
-
-    This limits the computation graph to just the lm_head projection
-    (~100M params × batch × seq) instead of the full 2.7B model graph.
-    """
+    """Memory-efficient Hessian compensation on lm_head."""
     if config.compensation_steps <= 0:
         return
 
-    logger.info(f"Hessian compensation: {config.compensation_steps} steps on lm_head (memory-efficient)")
+    logger.info(f"Hessian compensation: {config.compensation_steps} steps (memory-efficient)")
 
     has_cuda = torch.cuda.is_available()
     original_device = next(model.parameters()).device
@@ -184,7 +442,6 @@ def hessian_compensation(
         model.cuda()
     train_device = next(model.parameters()).device
 
-    # Freeze all, then unfreeze only lm_head
     for param in model.parameters():
         param.requires_grad = False
 
@@ -205,7 +462,6 @@ def hessian_compensation(
 
     optimizer = torch.optim.Adam(lm_head_params, lr=1e-5)
 
-    # Hook the transformer body to capture hidden states before lm_head
     _hidden_state = None
 
     def _save_last_hidden(module, args, output):
@@ -217,7 +473,6 @@ def hessian_compensation(
         else:
             _hidden_state = output.detach()
 
-    # Find the transformer model (e.g. PhiModel, LlamaModel, etc.)
     transformer = getattr(model, "model", None) or getattr(model, "transformer", None)
     if transformer is None:
         logger.warning("Cannot find transformer body — skipping compensation")
@@ -236,7 +491,6 @@ def hessian_compensation(
             if input_ids.shape[1] < 2:
                 continue
 
-            # Forward body under no_grad (zero activation memory for 2.7B params)
             _hidden_state = None
             with torch.no_grad():
                 model(input_ids=input_ids)
@@ -244,9 +498,7 @@ def hessian_compensation(
             if _hidden_state is None:
                 continue
 
-            # Forward ONLY lm_head with grad (tiny graph: ~100M params × 64 tokens)
             logits = lm_head(_hidden_state)
-
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = input_ids[..., 1:].contiguous()
             loss = nn.functional.cross_entropy(
@@ -275,97 +527,29 @@ def hessian_compensation(
     logger.info("Hessian compensation complete")
 
 
-def apply_pt_bitnet(
-    model: PreTrainedModel,
-    config: Optional[PTBitNetConfig] = None,
-    tokenizer=None,
-    calibration_texts: Optional[list[str]] = None,
-) -> PreTrainedModel:
-    """Apply PT-BitNet post-training ternary quantization.
+# ═══════════════════════════════════════════════════════════════════
+# Legacy API — kept for backward compatibility with tests
+# ═══════════════════════════════════════════════════════════════════
 
-    Iterates over nn.Linear layers and replaces weights with ternary values.
-    Optionally applies Hessian compensation on lm_head.
-
-    Args:
-        model: HuggingFace PreTrainedModel.
-        config: PT-BitNet configuration.
-        tokenizer: Tokenizer for compensation (optional).
-        calibration_texts: Texts for Hessian compensation (optional).
-    """
-    if config is None:
-        config = PTBitNetConfig()
-
-    logger.info("Starting PT-BitNet post-training quantization (vectorized)...")
-    if config.outlier_fraction > 0:
-        logger.info(f"  Outlier retention: {config.outlier_fraction*100:.1f}% weights kept in FP16")
-    model.eval()
-
-    targets = _find_quantizable_linears(model, config)
-    n_total = len(targets)
-
-    with torch.no_grad():
-        for i, (name, module) in enumerate(targets):
-            w = module.weight.data
-
-            # Move to GPU for speed if available
-            device = w.device
-            if torch.cuda.is_available():
-                w_gpu = w.cuda()
-            else:
-                w_gpu = w
-
-            # Stage 1: Normalize (clip outliers, center)
-            w_mean = w_gpu.mean(dim=-1, keepdim=True)
-            w_std = w_gpu.std(dim=-1, keepdim=True).clamp_min(1e-8)
-            w_norm = (w_gpu - w_mean) / w_std
-            w_norm = w_norm.clamp(-config.outlier_clip_threshold, config.outlier_clip_threshold)
-
-            # Stage 2: Vectorized ternary quantization
-            ternary_w = ternary_quantize_vectorized(w_norm, config)
-
-            # Denormalize back to original scale
-            ternary_w = ternary_w * w_std + w_mean
-            ternary_w = ternary_w.to(device=device, dtype=module.weight.dtype)
-
-            module.weight = nn.Parameter(ternary_w)
-            module.weight.requires_grad = False
-
-            if config.show_progress and (i + 1) % max(1, n_total // 10) == 0:
-                logger.info(f"  PT-BitNet: {i + 1}/{n_total} layers ({100 * (i + 1) // n_total}%)")
-
-    logger.info(f"PT-BitNet complete: {n_total} layers quantized to ternary")
-
-    # Optional: Hessian compensation on lm_head
-    if config.compensation_steps > 0 and tokenizer is not None and calibration_texts is not None:
-        hessian_compensation(model, tokenizer, calibration_texts, config)
-
-    return model
-
-
-# Legacy API — kept for backward compatibility with tests and pipeline
 def distribution_transform(
-    weight: torch.Tensor,
-    clip_threshold: float = 3.0,
+    weight: torch.Tensor, clip_threshold: float = 3.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stage 1: Per-channel normalization with outlier clipping."""
     w = weight.float()
     mean = w.mean(dim=-1, keepdim=True)
     std = w.std(dim=-1, keepdim=True).clamp_min(1e-8)
     w_norm = (w - mean) / std
-    w_clipped = torch.clamp(w_norm, -clip_threshold, clip_threshold)
     scale = w.abs().max(dim=-1, keepdim=True).values
-    return w_clipped, scale
+    return torch.clamp(w_norm, -clip_threshold, clip_threshold), scale
 
 
 def blockwise_optimize(
-    weight: torch.Tensor,
-    block_size: int = 128,
-    max_iter: int = 10,
-    tolerance: float = 1e-4,
+    weight: torch.Tensor, block_size: int = 128,
+    max_iter: int = 10, tolerance: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stage 2: Block-wise ternary optimization (vectorized version for tests)."""
-    config = PTBitNetConfig(block_size=block_size, max_iter=max_iter, tolerance=tolerance,
-                            outlier_fraction=0.0, show_progress=False)
-    ternary = ternary_quantize_vectorized(weight, config)
+    config = PTBitNetConfig(
+        block_size=block_size, max_iter=max_iter, tolerance=tolerance,
+        outlier_fraction=0.0, show_progress=False, asymmetric=False,
+    )
+    ternary = _symmetric_ternary(weight.float(), config)
     scales = weight.abs().max(dim=-1, keepdim=True).values
     return ternary, scales

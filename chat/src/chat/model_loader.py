@@ -450,31 +450,14 @@ def _compress_and_cache(
     else:
         logger.info("Stage 1/3: PT-BitNet [SKIPPED]")
 
-    # Stage 2: ParetoQ + ZeroQAT (GPU only — binary w_bits=1 destroys ternary sparsity)
+    # Stage 2: Intentionally skipped — Tequila provides ternary-aware QAT (see README)
+    # ParetoQ code is retained in paretoq/ as a research artifact.
+    # QuantizeLinear lacks a native ternary mode: w_bits=1 is binary {-1, +1}
+    # and w_bits=0 uses StretchedElasticQuant which scales weights by 0.667,
+    # both incompatible with PT-BitNet's {-α, 0, +α} output.
     if not _stage_done(cache_dir, 2):
-        if has_cuda:
-            logger.info("=" * 50)
-            logger.info("Stage 2/3: ParetoQ QAT + ZeroQAT (GPU)")
-            qat_steps, log_interval, batch_size = 100, 25, 2
-            t0 = time.time()
-            texts_data = _ensure_texts()
-            qat_dataloader = create_qat_dataloader(tokenizer, texts_data[:100], batch_size=batch_size, max_length=128)
-            zo_config = ZeroQATConfig(learning_rate=1e-5, max_steps=qat_steps,
-                                      perturbation_scale=1e-3, grad_clip=1.0)
-            model = model.cuda()
-            model = apply_paretoq_qat(
-                model=model, tokenizer=tokenizer, train_dataloader=qat_dataloader,
-                output_path=str(cache_dir / "stage2_qat"), w_bits=0, qat_steps=qat_steps,
-                zo_config=zo_config, log_interval=log_interval,
-            )
-            elapsed = time.time() - t0
-            logger.info(f"ParetoQ/ZeroQAT complete in {elapsed:.1f}s")
-            _save_model_state(model, tokenizer, cache_dir)
-            _mark_stage_done(cache_dir, 2, elapsed)
-        else:
-            logger.info("Stage 2/3: ParetoQ/ZeroQAT [SKIPPED — GPU only, PT-BitNet is sufficient on CPU]")
-            # Mark as done to skip on resume, since we intentionally skip QAT on CPU
-            _mark_stage_done(cache_dir, 2, 0)
+        logger.info("Stage 2/3: ParetoQ/ZeroQAT [SKIPPED — Tequila provides ternary-aware optimization]")
+        _mark_stage_done(cache_dir, 2, 0)
     else:
         logger.info("Stage 2/3: ParetoQ/ZeroQAT [SKIPPED]")
         model, tokenizer = _load_model_state(cache_dir, entry)
