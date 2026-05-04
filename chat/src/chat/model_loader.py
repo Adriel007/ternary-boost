@@ -257,18 +257,25 @@ def _replace_with_custom(model, custom_params, config, layer_cls, param_key):
 # ── Save with custom params ────────────────────────────────────────────
 
 def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
-    """Save standard HF model + separate custom params (weight_clip_val, Lambada)."""
+    """Save model in bfloat16 with minimal peak memory.
+
+    Converts the entire model to bfloat16 before extracting state_dict,
+    so all tensors are half-sized from the start. No intermediate copies.
+    Works on GPU, CPU, and memory-constrained environments (Colab 12 GB).
+    """
     model.config.save_pretrained(str(cache_dir))
     tokenizer.save_pretrained(str(cache_dir))
 
-    # Separate standard parameters from custom quantization parameters
-    standard_params = {}
-    custom_params = {}
-    for name, param in model.state_dict().items():
-        if "weight_clip_val" in name or "Lambada" in name:
-            custom_params[name] = param
-        else:
-            standard_params[name] = param
+    # Convert model to bf16 in-place (halves memory before saving)
+    model = model.to(dtype=torch.bfloat16)
+
+    # state_dict now references bf16 tensors directly — no extra copies
+    state = model.state_dict()
+
+    standard_params = {k: v for k, v in state.items()
+                       if "weight_clip_val" not in k and "Lambada" not in k}
+    custom_params = {k: v for k, v in state.items()
+                     if "weight_clip_val" in k or "Lambada" in k}
 
     from safetensors.torch import save_file
     save_file(standard_params, str(cache_dir / "model.safetensors"))
