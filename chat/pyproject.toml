@@ -1,0 +1,22 @@
+[project]
+name = "ternary-boost-chat"
+version = "0.1.0"
+description = "Interactive CLI chat for ternary-quantized LLMs"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.40.0",
+    "rich>=13.0.0",
+    "safetensors>=0.4.0",
+    "ternary-boost-shared",
+]
+
+[project.scripts]
+tchat = "chat.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

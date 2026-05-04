@@ -1,0 +1,19 @@
+[project]
+name = "ternary-boost-eval"
+version = "0.1.0"
+description = "Evaluation benchmarks and bitnet.cpp export for ternary models"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.40.0",
+    "lm-eval>=0.4.0",
+    "safetensors>=0.4.0",
+    "ternary-boost-shared",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

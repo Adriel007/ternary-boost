@@ -1,0 +1,20 @@
+[project]
+name = "paretoq"
+version = "0.1.0"
+description = "ParetoQ quantization-aware training with ZeroQAT zero-order optimization"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.40.0",
+    "datasets>=2.18.0",
+    "accelerate>=0.28.0",
+    "safetensors>=0.4.0",
+    "ternary-boost-shared",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

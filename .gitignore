@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+*.venv
+
+# uv
+uv.lock
+
+# Cache
+cache/
+__pycache__/
+.pytest_cache/
+*.fuse_hidden*
+
+# Output artifacts
+output/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.bitnet
+
+# Wandb
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secret files
+.env
+.env.local
+*.secret

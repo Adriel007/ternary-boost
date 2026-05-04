@@ -1,0 +1,53 @@
+# Ternary-Boost Pipeline Configuration
+# Hybrid LLM Compression: PT-BitNet + ParetoQ + ZeroQAT + Tequila
+#
+# Usage:
+#   python run_pipeline.py --config configs/pipeline_config.yaml
+
+model:
+  name_or_path: "meta-llama/Llama-2-7b-hf"
+  dtype: "bfloat16"
+  device: "cuda"
+
+output:
+  base_dir: "./output"
+
+stages:
+  pt_bitnet:
+    enabled: true
+    block_size: 128
+    clip_threshold: 3.0
+
+  paretoq_qat:
+    enabled: true
+    w_bits: 1
+    num_steps: 500
+    learning_rate: 1.0e-5
+    perturbation_scale: 1.0e-3
+    batch_size: 4
+    grad_clip: 1.0
+
+  tequila:
+    enabled: true
+    quant_method: "ultraquantv3"
+    num_epochs: 1
+    range_of_lambada: 0.01
+
+evaluation:
+  enabled: true
+  tasks:
+    - mmlu
+    - hellaswag
+    - arc_easy
+    - arc_challenge
+  batch_size: 16
+  compare_original: true
+
+export:
+  enabled: true
+  format: "bitnet_cpp"
+
+logging:
+  wandb:
+    enabled: false
+    project: "ternary-boost"
