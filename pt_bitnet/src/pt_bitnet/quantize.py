@@ -207,10 +207,9 @@ def hessian_compensation(
             if input_ids.shape[1] < 2:
                 continue
 
-            # Forward through quantized model
-            with torch.no_grad():
-                outputs = model(input_ids=input_ids)
-                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            # Forward through quantized model (grad needed for lm_head compensation)
+            outputs = model(input_ids=input_ids)
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
 
             # Teacher forcing: next-token prediction loss
             shift_logits = logits[..., :-1, :].contiguous()
