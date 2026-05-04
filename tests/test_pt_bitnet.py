@@ -66,6 +66,7 @@ class TestBlockwiseOptimize:
             weight, block_size=16, max_iter=20
         )
         # Each row should have at most 3 distinct values (ternary structure)
+        # Note: outlier_fraction=0 by default, so no FP16 outliers
         for row in quantized:
             unique_vals = row.unique()
             assert unique_vals.numel() <= 3, f"Row has {unique_vals.numel()} unique values: {unique_vals}"
@@ -116,12 +117,23 @@ class TestApplyPTBitNet:
 
     def test_apply_to_model(self):
         model = DummyModel()
-        config = PTBitNetConfig(show_progress=False)
+        config = PTBitNetConfig(show_progress=False, outlier_fraction=0.0)
         quantized = apply_pt_bitnet(model, config)
 
         assert quantized.q_proj.weight.requires_grad is False
 
-        # Each row should have at most 3 unique values (ternary structure)
+        # Each row should have at most 3 unique values (ternary structure, no outliers)
         for row in quantized.q_proj.weight:
             unique_q = row.unique()
             assert unique_q.numel() <= 3, f"Row has {unique_q.numel()} unique values"
+
+    def test_apply_to_model_with_outliers(self):
+        model = DummyModel()
+        config = PTBitNetConfig(show_progress=False, outlier_fraction=0.05)
+        quantized = apply_pt_bitnet(model, config)
+
+        assert quantized.q_proj.weight.requires_grad is False
+        # With outliers, each row has up to 3 ternary values + some FP16 outliers
+        for row in quantized.q_proj.weight:
+            unique_q = row.unique()
+            assert unique_q.numel() <= 10, f"Row has {unique_q.numel()} unique values"

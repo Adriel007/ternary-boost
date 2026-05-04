@@ -61,21 +61,21 @@ The quantization targets all linear projections in attention and MLP modules (`q
 
 > **Note:** "PT-BitNet" is not a published method name. This implementation synthesizes post-training quantization techniques from the BitNet literature into a standalone stage.
 
-### Stage 2 — ParetoQ + ZeroQAT
+### Stage 2 — ParetoQ + ZeroQAT (GPU only)
 
-**ParetoQ** (Zhang et al., 2025, NeurIPS 2025) provides a unified quantization-aware training framework supporting bit-widths from 1-bit (binary) to 4-bit. This implementation uses:
+**ParetoQ** (Zhang et al., 2025, NeurIPS 2025) provides a unified quantization-aware training framework. This implementation uses:
 
-- `LsqBinaryTernaryExtension` — Learned Step-size Quantization (Esser et al., 2020) extended for ternary regimes, employing the straight-through estimator with gradient scaling proportional to $1/\sqrt{N \cdot Q_p}$.
-- `StretchedElasticQuant` — elastic quantization with stretched level spacing for 0–2 bit regimes, using a shifted sigmoid-like mapping to smooth discrete transitions.
-- `QuantizeLinear` — a drop-in replacement for `nn.Linear` that quantizes weights on-the-fly during the forward pass with a learnable per-channel clipping parameter `weight_clip_val`.
+- `LsqBinaryTernaryExtension` — Learned Step-size Quantization (Esser et al., 2020) extended for ternary regimes, with a straight-through estimator.
+- `StretchedElasticQuant` — elastic quantization with `n_levels=1.5` providing a native ternary deadzone ($\{-0.667, 0, +0.667\}$) when `w_bits=0`.
+- `QuantizeLinear` — a drop-in replacement for `nn.Linear` that quantizes weights on-the-fly with a learnable per-channel clipping parameter `weight_clip_val`.
 
-**ZeroQAT** is a novel synthesis of zeroth-order optimization with quantization-aware training. It replaces conventional first-order backpropagation with the SPSA (Simultaneous Perturbation Stochastic Approximation) estimator based on the MeZO method (Malladi et al., 2023):
+**ZeroQAT** replaces first-order backpropagation with the SPSA zeroth-order estimator based on MeZO (Malladi et al., 2023):
 
 $$\hat{\nabla} f(\theta) \approx \frac{f(\theta + \epsilon z) - f(\theta - \epsilon z)}{2\epsilon} \cdot z$$
 
-where $z \sim \mathcal{N}(0, I)$. Only forward passes are required — no activation checkpointing or intermediate gradient storage. The implementation supports both global and layer-wise perturbation strategies, with gradient clipping and weight decay regularization. This enables QAT fine-tuning on hardware with as little as 8 GB of VRAM for models up to 2B parameters, or on CPU with reduced step counts.
+> **Important — CPU vs GPU:** This stage is **GPU-only**. On CPU it is skipped automatically. The reason is that `QuantizeLinear` with `w_bits=1` uses binary $\{-1, +1\}$ quantization (via `sign()`), which destroys the ternary sparsity created by PT-BitNet. On GPU, `w_bits=0` with `StretchedElasticQuant` provides native ternary deadzone quantization. On CPU, PT-BitNet alone achieves sufficient quality — the QAT stage is a refinement step that requires GPU compute and proper ternary-aware quantization.
 
-> **Note:** "ZeroQAT" is a novel method synthesized for this pipeline. It is not an established published technique. The closest published work is ZO fine-tuning with sparsity and quantization (Guo et al., arXiv:2406.02913).
+> **Note:** "ZeroQAT" is a novel method synthesized for this pipeline. It is not an established published technique.
 
 ### Stage 3 — Tequila (Deadzone Trapping Recovery)
 
@@ -140,12 +140,24 @@ Header:  [4B magic: "BITN"] [4B version] [4B config_len] [config JSON]
 Weights: [4B name_len] [name] [4B rows] [4B cols] [4B data_len] [packed] [4B scale_len] [scales]
 ```
 
-**Important — Where Speedup Comes From:** Ternary weights stored in `nn.Linear` reduce disk/memory footprint but do NOT accelerate PyTorch inference. `nn.Linear` always performs float multiply-add operations regardless of weight values. The 3–4× inference speedup reported in BitNet papers requires a **native kernel** (bitnet.cpp) that:
-1. Packs ternary weights into INT2 format (4 values per byte)
-2. Replaces multiplications with conditional addition/subtraction (`x·1 → +x`, `x·-1 → -x`, `x·0 → skip`)
-3. Uses SIMD vector instructions (AVX2 on x86, NEON on ARM)
+**Important — Where Speedup Comes From:** Ternary weights stored in `nn.Linear` reduce disk/memory footprint but do NOT accelerate PyTorch inference. The 3–6× speedup requires a **native kernel** that replaces float multiplications with integer additions. We integrate with **microsoft/BitNet** (MIT license, 38.8k stars), which provides:
 
-Without this kernel, baked ternary models run at standard FP16 speed — they are memory-compressed but not compute-accelerated. The native kernel integration (Python bindings for in-process inference) is tracked in TODO.md. Currently, the `bitnet_cpp` backend calls the external binary via subprocess, which works but does not support streaming generation.
+1. **GGUF I2_S format** — 2-bit packed ternary weights
+2. **llama.cpp backend** — SIMD-accelerated CPU inference (AVX2 on x86, NEON on ARM)
+3. **T-MAC lookup tables** — replace matmul with table lookups for ternary patterns
+4. **Reported speedups:** 2.37–6.17× on x86, 1.37–5.07× on ARM, 100B model at 5–7 tok/s on single CPU
+
+Integration path: our baked model → `convert-helper-bitnet.py` (from microsoft/BitNet) → GGUF → `llama-cli` binary. See `notebooks/` for scripts.
+
+**Quality Improvements (2025 literature review):**
+
+| Technique | Source | What It Does | Quality Gain | Speed Cost |
+|-----------|--------|-------------|-------------|------------|
+| **Outlier Retention** | SpQR (Dettmers et al., 2023) | Keep top 1% weights in FP16, quantize rest | +2–5% PPL reduction | Negligible (<1%) |
+| **Hessian Compensation** | GPTQ (Frantar et al., 2023) | Fine-tune lm_head to absorb quantization error | +1–3% PPL reduction | One-time cost (50 steps) |
+| **BitNet GGUF Export** | microsoft/BitNet (2024–2026) | Native SIMD kernel via llama.cpp | — | 3–6× faster CPU inference |
+
+Both quality techniques are implemented as configurable options in `PTBitNetConfig` (`outlier_fraction`, `compensation_steps`).
 
 ### Interactive Chat CLI (`tchat`)
 

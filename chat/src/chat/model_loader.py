@@ -337,20 +337,7 @@ def _compress_and_cache(
         logger.info(f"Base model loaded in {time.time() - t0:.1f}s "
                     f"({sum(p.numel() for p in model.parameters()):,} params)")
 
-    # Stage 1: PT-BitNet
-    if not _stage_done(cache_dir, 1):
-        logger.info("=" * 50)
-        logger.info("Stage 1/3: PT-BitNet post-training quantization")
-        t0 = time.time()
-        model = apply_pt_bitnet(model, PTBitNetConfig(block_size=128, outlier_clip_threshold=3.0))
-        elapsed = time.time() - t0
-        logger.info(f"PT-BitNet complete in {elapsed:.1f}s")
-        _save_model_state(model, tokenizer, cache_dir)
-        _mark_stage_done(cache_dir, 1, elapsed)
-    else:
-        logger.info("Stage 1/3: PT-BitNet [SKIPPED]")
-
-    # Calibration data
+    # Calibration data (cached after first load, used by all stages)
     texts = None
 
     def _ensure_texts():
@@ -364,30 +351,50 @@ def _compress_and_cache(
             texts = ["The capital of France is Paris. " * 10] * 70
         return texts
 
-    # Stage 2: ParetoQ + ZeroQAT
-    if not _stage_done(cache_dir, 2):
+    # Stage 1: PT-BitNet
+    if not _stage_done(cache_dir, 1):
         logger.info("=" * 50)
-        logger.info("Stage 2/3: ParetoQ QAT + ZeroQAT")
-        if has_cuda:
-            qat_steps, log_interval, batch_size = 100, 25, 2
-        else:
-            qat_steps, log_interval, batch_size = 20, 5, 1
+        logger.info("Stage 1/3: PT-BitNet post-training quantization")
         t0 = time.time()
-        texts_data = _ensure_texts()
-        qat_dataloader = create_qat_dataloader(tokenizer, texts_data[:100], batch_size=batch_size, max_length=128)
-        zo_config = ZeroQATConfig(learning_rate=1e-5, max_steps=qat_steps,
-                                  perturbation_scale=1e-3, grad_clip=1.0)
-        if has_cuda:
-            model = model.cuda()
-        model = apply_paretoq_qat(
-            model=model, tokenizer=tokenizer, train_dataloader=qat_dataloader,
-            output_path=str(cache_dir / "stage2_qat"), w_bits=1, qat_steps=qat_steps,
-            zo_config=zo_config, log_interval=log_interval,
+        model = apply_pt_bitnet(
+            model,
+            PTBitNetConfig(block_size=128, outlier_clip_threshold=3.0,
+                           outlier_fraction=0.01, compensation_steps=50),
+            tokenizer=tokenizer,
+            calibration_texts=_ensure_texts()[:32],
         )
         elapsed = time.time() - t0
-        logger.info(f"ParetoQ/ZeroQAT complete in {elapsed:.1f}s")
+        logger.info(f"PT-BitNet complete in {elapsed:.1f}s")
         _save_model_state(model, tokenizer, cache_dir)
-        _mark_stage_done(cache_dir, 2, elapsed)
+        _mark_stage_done(cache_dir, 1, elapsed)
+    else:
+        logger.info("Stage 1/3: PT-BitNet [SKIPPED]")
+
+    # Stage 2: ParetoQ + ZeroQAT (GPU only — binary w_bits=1 destroys ternary sparsity)
+    if not _stage_done(cache_dir, 2):
+        if has_cuda:
+            logger.info("=" * 50)
+            logger.info("Stage 2/3: ParetoQ QAT + ZeroQAT (GPU)")
+            qat_steps, log_interval, batch_size = 100, 25, 2
+            t0 = time.time()
+            texts_data = _ensure_texts()
+            qat_dataloader = create_qat_dataloader(tokenizer, texts_data[:100], batch_size=batch_size, max_length=128)
+            zo_config = ZeroQATConfig(learning_rate=1e-5, max_steps=qat_steps,
+                                      perturbation_scale=1e-3, grad_clip=1.0)
+            model = model.cuda()
+            model = apply_paretoq_qat(
+                model=model, tokenizer=tokenizer, train_dataloader=qat_dataloader,
+                output_path=str(cache_dir / "stage2_qat"), w_bits=0, qat_steps=qat_steps,
+                zo_config=zo_config, log_interval=log_interval,
+            )
+            elapsed = time.time() - t0
+            logger.info(f"ParetoQ/ZeroQAT complete in {elapsed:.1f}s")
+            _save_model_state(model, tokenizer, cache_dir)
+            _mark_stage_done(cache_dir, 2, elapsed)
+        else:
+            logger.info("Stage 2/3: ParetoQ/ZeroQAT [SKIPPED — GPU only, PT-BitNet is sufficient on CPU]")
+            # Mark as done to skip on resume, since we intentionally skip QAT on CPU
+            _mark_stage_done(cache_dir, 2, 0)
     else:
         logger.info("Stage 2/3: ParetoQ/ZeroQAT [SKIPPED]")
         model, tokenizer = _load_model_state(cache_dir, entry)
