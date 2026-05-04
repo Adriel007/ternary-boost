@@ -178,6 +178,13 @@ def hessian_compensation(
     logger.info(f"Hessian compensation: {config.compensation_steps} steps on lm_head")
     model.eval()
 
+    # Use GPU if available for faster backward passes
+    has_cuda = torch.cuda.is_available()
+    original_device = next(model.parameters()).device
+    if has_cuda and original_device.type == "cpu":
+        model.cuda()
+    train_device = next(model.parameters()).device
+
     # Freeze all except lm_head
     for name, param in model.named_parameters():
         param.requires_grad = "lm_head" in name
@@ -187,11 +194,7 @@ def hessian_compensation(
         logger.warning("No lm_head found — skipping compensation")
         return
 
-    # Store original lm_head
-    original_lm_head = {n: p.data.clone() for n, p in model.named_parameters() if "lm_head" in n}
-
     optimizer = torch.optim.Adam(lm_head_params, lr=1e-5)
-    has_cuda = torch.cuda.is_available()
 
     for step in range(config.compensation_steps):
         total_loss = 0.0
@@ -199,9 +202,7 @@ def hessian_compensation(
 
         for text in calibration_texts[: min(len(calibration_texts), 16)]:
             inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
-            input_ids = inputs["input_ids"]
-            if has_cuda:
-                input_ids = input_ids.cuda()
+            input_ids = inputs["input_ids"].to(train_device)
 
             if input_ids.shape[1] < 2:
                 continue
@@ -230,7 +231,9 @@ def hessian_compensation(
             avg_loss = total_loss / max(n_batches, 1)
             logger.info(f"  Compensation step {step + 1}/{config.compensation_steps} - loss: {avg_loss:.4f}")
 
-    # Re-freeze
+    # Restore model to original device and re-freeze all params
+    if has_cuda and original_device.type == "cpu":
+        model.cpu()
     for name, param in model.named_parameters():
         param.requires_grad = False
 
