@@ -165,53 +165,88 @@ def hessian_compensation(
 ) -> None:
     """Compensate quantization error by fine-tuning lm_head (Hessian-style).
 
-    After ternary quantization of linear layers, the lm_head (output projection)
-    can be adjusted to absorb some of the quantization error. This uses a
-    first-order approximation of the Hessian: gradient descent on the MSE
-    between the original and quantized model's output logits.
+    Memory-efficient design:
+      transformer body → runs under torch.no_grad() (zero activation memory)
+      hidden_states     → detached from graph
+      lm_head           → only module with requires_grad=True
 
-    Only lm_head parameters are updated; all other weights remain frozen.
+    This limits the computation graph to just the lm_head projection
+    (~100M params × batch × seq) instead of the full 2.7B model graph.
     """
     if config.compensation_steps <= 0:
         return
 
-    logger.info(f"Hessian compensation: {config.compensation_steps} steps on lm_head")
-    model.eval()
+    logger.info(f"Hessian compensation: {config.compensation_steps} steps on lm_head (memory-efficient)")
 
-    # Use GPU if available for faster backward passes
     has_cuda = torch.cuda.is_available()
     original_device = next(model.parameters()).device
     if has_cuda and original_device.type == "cpu":
         model.cuda()
     train_device = next(model.parameters()).device
 
-    # Freeze all except lm_head
-    for name, param in model.named_parameters():
-        param.requires_grad = "lm_head" in name
+    # Freeze all, then unfreeze only lm_head
+    for param in model.parameters():
+        param.requires_grad = False
 
-    lm_head_params = [p for n, p in model.named_parameters() if "lm_head" in n]
-    if not lm_head_params:
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        for module in model.modules():
+            if isinstance(module, nn.Linear):
+                lm_head = module
+    if lm_head is None:
         logger.warning("No lm_head found — skipping compensation")
         return
 
+    lm_head.weight.requires_grad = True
+    lm_head_params = [lm_head.weight]
+    if hasattr(lm_head, "bias") and lm_head.bias is not None:
+        lm_head.bias.requires_grad = True
+        lm_head_params.append(lm_head.bias)
+
     optimizer = torch.optim.Adam(lm_head_params, lr=1e-5)
+
+    # Hook the transformer body to capture hidden states before lm_head
+    _hidden_state = None
+
+    def _save_last_hidden(module, args, output):
+        nonlocal _hidden_state
+        if hasattr(output, "last_hidden_state"):
+            _hidden_state = output.last_hidden_state.detach()
+        elif isinstance(output, tuple):
+            _hidden_state = output[0].detach()
+        else:
+            _hidden_state = output.detach()
+
+    # Find the transformer model (e.g. PhiModel, LlamaModel, etc.)
+    transformer = getattr(model, "model", None) or getattr(model, "transformer", None)
+    if transformer is None:
+        logger.warning("Cannot find transformer body — skipping compensation")
+        return
+
+    hook_handle = transformer.register_forward_hook(_save_last_hidden)
 
     for step in range(config.compensation_steps):
         total_loss = 0.0
         n_batches = 0
 
         for text in calibration_texts[: min(len(calibration_texts), 16)]:
-            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
+            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=64)
             input_ids = inputs["input_ids"].to(train_device)
 
             if input_ids.shape[1] < 2:
                 continue
 
-            # Forward through quantized model (grad needed for lm_head compensation)
-            outputs = model(input_ids=input_ids)
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            # Forward body under no_grad (zero activation memory for 2.7B params)
+            _hidden_state = None
+            with torch.no_grad():
+                model(input_ids=input_ids)
 
-            # Teacher forcing: next-token prediction loss
+            if _hidden_state is None:
+                continue
+
+            # Forward ONLY lm_head with grad (tiny graph: ~100M params × 64 tokens)
+            logits = lm_head(_hidden_state)
+
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = input_ids[..., 1:].contiguous()
             loss = nn.functional.cross_entropy(
@@ -221,6 +256,7 @@ def hessian_compensation(
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(lm_head_params, 1.0)
             optimizer.step()
 
             total_loss += loss.item()
@@ -230,10 +266,10 @@ def hessian_compensation(
             avg_loss = total_loss / max(n_batches, 1)
             logger.info(f"  Compensation step {step + 1}/{config.compensation_steps} - loss: {avg_loss:.4f}")
 
-    # Restore model to original device and re-freeze all params
+    hook_handle.remove()
     if has_cuda and original_device.type == "cpu":
         model.cpu()
-    for name, param in model.named_parameters():
+    for param in model.parameters():
         param.requires_grad = False
 
     logger.info("Hessian compensation complete")
