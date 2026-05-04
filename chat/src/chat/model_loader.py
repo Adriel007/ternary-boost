@@ -84,10 +84,18 @@ def _load_cached(cache_dir: Path, entry: ModelEntry) -> tuple[PreTrainedModel, P
     dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
     dtype = dtype_map.get(entry.dtype, torch.bfloat16)
 
+    # Fix: newer transformers requires pad_token_id on config
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(
+        str(cache_dir), trust_remote_code=True,
+    )
+    if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
+        config.pad_token_id = 0
     model = AutoModelForCausalLM.from_pretrained(
         str(cache_dir), torch_dtype=dtype, low_cpu_mem_usage=True,
         device_map="cpu", trust_remote_code=True,
         cache_dir=str(cache_dir.parent.parent / "huggingface"),
+        config=config,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         str(cache_dir), trust_remote_code=True,
@@ -325,9 +333,17 @@ def _compress_and_cache(
         logger.info("=" * 50)
         logger.info(f"Loading base model: {entry.path}")
         t0 = time.time()
+        # Fix: newer transformers requires pad_token_id on config
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(
+            entry.path, trust_remote_code=True, cache_dir=str(hf_cache),
+        )
+        if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
+            config.pad_token_id = 0
         model = AutoModelForCausalLM.from_pretrained(
             entry.path, torch_dtype=dtype, low_cpu_mem_usage=True,
             device_map="cpu", trust_remote_code=True, cache_dir=str(hf_cache),
+            config=config,
         )
         tokenizer = AutoTokenizer.from_pretrained(
             entry.path, trust_remote_code=True, cache_dir=str(hf_cache),
