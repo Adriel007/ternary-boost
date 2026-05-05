@@ -96,31 +96,47 @@ def asymmetric_ternary_init(
 
 def build_optimal_grid(
     T: torch.Tensor, w: torch.Tensor,
+    alpha_init: torch.Tensor = None,
+    mu_init: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Closed-form optimal grid parameters (α*, μ*) given fixed T.
 
-    PT²-LLM Eq. 9, vectorized across all rows:
-      α* = [m·(W⊙T)1 - (T1)⊙(W1)] / [m·(T⊙T)1 - (T1)²]
-      μ* = [(T⊙T)1⊙(W1) - (T1)⊙((W⊙T)1)] / [m·(T⊙T)1 - (T1)²]
-
-    All operations are batched across output features.
+    PT²-LLM Eq. 9. Includes numerical safeguards:
+      - Degenerate rows (all-zero T) keep their initialization
+      - α bounded to [0.1*α_init, 10*α_init]
+      - μ bounded to [μ_init - 3*α_init, μ_init + 3*α_init]
     """
-    m = w.shape[1]  # number of columns
-    WoT = w * T           # element-wise
-    ToT = T * T           # element-wise (T ⊙ T)
+    m = w.shape[1]
+    WoT = w * T
+    ToT = T * T
 
-    sum_WoT = WoT.sum(dim=-1)       # [out_f]
-    sum_ToT = ToT.sum(dim=-1)       # [out_f]
-    sum_T = T.sum(dim=-1)           # [out_f]
-    sum_W = w.sum(dim=-1)           # [out_f]
+    sum_WoT = WoT.sum(dim=-1)
+    sum_ToT = ToT.sum(dim=-1)
+    sum_T = T.sum(dim=-1)
+    sum_W = w.sum(dim=-1)
 
-    denom = m * sum_ToT - sum_T * sum_T   # [out_f]
-    denom = denom.clamp_min(1e-8)
+    denom = m * sum_ToT - sum_T * sum_T
+    safe = denom.abs() > 1e-6
 
-    alpha = (m * sum_WoT - sum_T * sum_W) / denom          # [out_f]
-    mu = (sum_ToT * sum_W - sum_T * sum_WoT) / denom       # [out_f]
+    alpha = torch.zeros_like(sum_W)
+    mu = torch.zeros_like(sum_W)
 
-    return alpha.unsqueeze(-1), mu.unsqueeze(-1)           # [out_f, 1]
+    denom_safe = torch.where(safe, denom, torch.ones_like(denom))
+    alpha_raw = (m * sum_WoT - sum_T * sum_W) / denom_safe
+    mu_raw = (sum_ToT * sum_W - sum_T * sum_WoT) / denom_safe
+
+    if alpha_init is not None and mu_init is not None:
+        ai = alpha_init.squeeze(-1)
+        mi = mu_init.squeeze(-1)
+        # Bound α: [0.1×init, 10×init]
+        alpha = torch.where(safe, alpha_raw.clamp(ai * 0.1, ai * 10), ai)
+        # Bound μ: [init - 3α, init + 3α]
+        mu = torch.where(safe, mu_raw.clamp(mi - 3 * alpha, mi + 3 * alpha), mi)
+    else:
+        alpha = torch.where(safe, alpha_raw, alpha_raw.abs().clamp_min(1e-6))
+        mu = torch.where(safe, mu_raw, torch.zeros_like(mu_raw))
+
+    return alpha.unsqueeze(-1), mu.unsqueeze(-1)
 
 
 def flexible_rounding(
@@ -203,10 +219,12 @@ def iterative_ternary_fitting(
     Converges in ~10 iterations. Each step is closed-form — no gradients.
     """
     alpha, mu, T = asymmetric_ternary_init(w)
+    alpha_init = alpha.clone()
+    mu_init = mu.clone()
 
     for _ in range(config.itf_iterations):
         T_prev = T.clone()
-        alpha, mu = build_optimal_grid(T, w)
+        alpha, mu = build_optimal_grid(T, w, alpha_init, mu_init)
         T = flexible_rounding(w, alpha, mu)
         if torch.equal(T, T_prev):
             break
@@ -218,17 +236,15 @@ def activation_aware_grid_alignment(
     w: torch.Tensor,
     T: torch.Tensor,
     X: Optional[torch.Tensor],
+    alpha_init: torch.Tensor = None,
+    mu_init: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """AGA: refine grid parameters to minimize output error.
 
-    PT²-LLM Eq. 13:
-      Minimizes ||WX - (αT+μ)X||² instead of ||W - (αT+μ)||².
-      Uses calibration activations X to align quantized outputs.
-
-    If X is None, returns the weight-space optimal (α, μ) from build_optimal_grid.
+    PT²-LLM Eq. 13. Includes same numerical safeguards as build_optimal_grid.
     """
     if X is None:
-        return build_optimal_grid(T, w)
+        return build_optimal_grid(T, w, alpha_init, mu_init)
 
     # Compute activation covariance S = sum over batch of X_b X_b^T
     # X shape: [B, L, m] → reshape to [B*L, m]
@@ -297,7 +313,8 @@ def ternary_quantize_vectorized(
 
         # --- AGA: refine grid with calibration inputs ---
         if calibration_inputs is not None:
-            alpha, mu = activation_aware_grid_alignment(w_quant, T, calibration_inputs)
+            alpha, mu = activation_aware_grid_alignment(
+                w_quant, T, calibration_inputs, alpha, mu)
 
         # Reconstruct: Ŵ = αT + μ
         reconstructed = alpha * T + mu
@@ -385,23 +402,17 @@ def apply_pt_bitnet(
             if calib_in is not None and torch.cuda.is_available():
                 calib_in = calib_in.cuda()
 
-                    # SSR: reorder columns for compact block distribution
-            w_reordered, inv_perm = structural_similarity_reorder(
-                w_quant, block_size=config.block_size,
-            )
-
-            # Normalize before quantization
-            w_mean = w_reordered.mean(dim=-1, keepdim=True)
-            w_std = w_reordered.std(dim=-1, keepdim=True).clamp_min(1e-8)
-            w_norm = (w_reordered - w_mean) / w_std
+                    # Normalize before quantization
+            w_mean = w_quant.mean(dim=-1, keepdim=True)
+            w_std = w_quant.std(dim=-1, keepdim=True).clamp_min(1e-8)
+            w_norm = (w_quant - w_mean) / w_std
             w_norm = w_norm.clamp(-config.outlier_clip_threshold, config.outlier_clip_threshold)
 
-            # PT²-LLM quantization on reordered weights
+            # PT²-LLM quantization (no SSR — SSR needs debugging, see TODO)
             ternary_w = ternary_quantize_vectorized(w_norm, config, calib_in)
 
-            # Denormalize and reverse reordering
+            # Denormalize
             ternary_w = ternary_w * w_std + w_mean
-            ternary_w = ternary_w[:, inv_perm]  # Undo column reordering
             ternary_w = ternary_w.to(device=device, dtype=module.weight.dtype)
 
             module.weight = nn.Parameter(ternary_w)

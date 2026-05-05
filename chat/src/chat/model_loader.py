@@ -436,10 +436,12 @@ def _compress_and_cache(
         logger.info("=" * 50)
         logger.info("Stage 1/3: PT-BitNet post-training quantization")
         t0 = time.time()
+        comp_steps = 50 if has_cuda else 10  # CPU: fast, GPU: thorough
         model = apply_pt_bitnet(
             model,
             PTBitNetConfig(block_size=128, outlier_clip_threshold=3.0,
-                           outlier_fraction=0.01, compensation_steps=50),
+                           outlier_fraction=0.01, compensation_steps=comp_steps,
+                           asymmetric=True),   # PT²-LLM ITF: fast, closed-form
             tokenizer=tokenizer,
             calibration_texts=_ensure_texts()[:32],
         )

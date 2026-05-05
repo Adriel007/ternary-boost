@@ -11,13 +11,14 @@ Or just copy-paste the entire script into a Colab cell and run.
 import sys, os, time, json
 
 # ── Setup ──────────────────────────────────────────────────────────
-REPO = "https://github.com/adriel007/ternary-boost.git"
-DIR = "ternary-boost"
-
-if not os.path.exists(DIR):
-    os.system(f"git clone {REPO} 2>&1")
-os.chdir(DIR)
-os.system("git pull 2>&1")
+# Script expects to be run from INSIDE the ternary-boost directory.
+# The user should have cloned and cd'd before running this.
+ROOT = os.getcwd()
+if not os.path.exists(os.path.join(ROOT, "pyproject.toml")):
+    # Try parent directory (if we're in scripts/)
+    ROOT = os.path.dirname(ROOT)
+    if not os.path.exists(os.path.join(ROOT, "pyproject.toml")):
+        raise RuntimeError("Not in ternary-boost directory. Run: %cd ternary-boost")
 
 for m in ["shared", "pt_bitnet", "tequila", "chat"]:
     sys.path.insert(0, os.path.join(m, "src"))
