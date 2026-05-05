@@ -21,10 +21,15 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
 def load_base():
+    from transformers import AutoConfig
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     tok.pad_token = tok.eos_token
+    config = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
+    if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
+        config.pad_token_id = 0
     model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=dtype,
-        low_cpu_mem_usage=True, device_map=device, trust_remote_code=True)
+        low_cpu_mem_usage=True, device_map=device, trust_remote_code=True,
+        config=config)
     return model, tok
 
 def test(model, tok, label):
