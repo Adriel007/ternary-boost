@@ -276,6 +276,9 @@ def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
     shard_bytes = 0
     shard_idx = 0
     shard_files = []
+    total_params = sum(1 for _ in model.named_parameters())
+    param_count = 0
+    last_log = [0]  # mutable for progress tracking
 
     def _flush_shard():
         nonlocal shard_batch, shard_bytes, shard_idx
@@ -285,13 +288,17 @@ def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
         path = str(cache_dir / name)
         save_file(shard_batch, path)
         shard_files.append((name, list(shard_batch.keys())))
+        logger.info(f"  Saved shard {shard_idx + 1}: {name} "
+                    f"({len(shard_batch)} tensors, {shard_bytes/1e9:.2f} GB)")
         shard_batch.clear()
         shard_bytes = 0
         shard_idx += 1
 
+    logger.info(f"Saving model ({total_params} params, sharded)...")
     # Iterate tensors one at a time — no full state_dict in memory
     custom_params = {}
     for key, param in model.named_parameters():
+        param_count += 1
         tensor = param.detach().to(torch.bfloat16).cpu()
         nbytes = tensor.numel() * tensor.element_size()
 
@@ -309,6 +316,12 @@ def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
             for fname, keys in shard_files[-1:]:
                 for k in keys:
                     weight_map[k] = fname
+
+        # Progress: log at 25%, 50%, 75%
+        pct = 100 * param_count // total_params
+        if pct >= last_log[0] + 25:
+            logger.info(f"  Saving: {pct}% ({param_count}/{total_params} tensors)")
+            last_log[0] = pct
 
     _flush_shard()
     for fname, keys in shard_files[-1:]:
