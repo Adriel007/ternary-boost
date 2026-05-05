@@ -1,107 +1,105 @@
 # TODO
 
-Items that require external infrastructure, upstream changes, or additional
-hardware before they can be implemented.
+## Critical (pipeline doesn't work end-to-end)
 
-## Chat Module
+### ITF Numerical Stability
+The asymmetric `build_optimal_grid` produces extreme alpha/mu values for
+degenerate rows (T all-zero or all-same-sign). Current fix clamps alpha to
+[0.1×init, 10×init] and mu to [init-3α, init+3α], but this hasn't been
+validated end-to-end. Need: proper bounds testing + fallback to symmetric
+for unstable rows.
 
-### Native Thinking/Reasoning Tokens
+### SSR Column Permutation Bug
+`structural_similarity_reorder` reorders columns before quantization but
+the inverse permutation is likely incorrect. Output was garbled when SSR
+was enabled. Currently **disabled**. Either fix inverse permutation or
+remove SSR permanently.
 
-Ternary models (BitNet b1.58, LLaMA quantized) do not natively support dedicated
-reasoning tokens (`<|thinking|>`, `</|thinking|>`) in their tokenizer vocabularies.
-The current `/thinking` implementation uses prompt-level chain-of-thought
-prefixing, which works but is not as clean as native thinking support.
+### AGA Activation Collection Broken on GPU
+`_collect_activations` registers hooks on nn.Linear but collected 0 layers
+on T4 (Colab). Hooks fire on forward pass but model device vs input device
+mismatch may cause silent failure. Either fix device handling or skip AGA.
 
-**Required to implement natively:**
-- Fine-tune the ternary model with thinking tokens added to the vocabulary
-- Requires QAT-aware training with the extended tokenizer
-- ~10B tokens of chain-of-thought training data
+### Colab T4 OOM During Tequila
+Pipeline works through PT-BitNet + compensation (loss 5.72, 185s on T4)
+but OOMs when Tequila starts. 15.6 GB VRAM filled by model (11 GB) +
+optimizer states + forward activations. Need: memory profiling, model.cpu()
+before save then back to GPU for Tequila.
 
-### bitnet.cpp Streaming
+### No Successful End-to-End Run
+Pipeline has never completed a full run producing valid output. Base FP16
+Phi-2 correctly answers "Paris" with "Question:...\nAnswer:" format but
+ternary model output is garbage. Root cause: ITF numerical instability.
 
-The current `bitnet.cpp` backend calls the binary as a subprocess (`subprocess.run`),
-which means no streaming token output. Streaming requires a Python binding
-(waiting on upstream `bitnet.cpp` Python bindings) or implementing a socket-based
-streaming protocol.
+### No Native Kernel Integration
+Baked nn.Linear weights are ternary but inference uses float matmul
+(same speed as FP16). The 3-6× speedup from BitNet papers requires
+microsoft/BitNet GGUF I2_S format + llama.cpp SIMD kernels. We have
+the conversion path documented but not implemented.
 
-### Multi-GPU Tensor Parallelism
+## Near-term (post-stability)
 
-For models >7B parameters, tensor parallelism across multiple GPUs would be
-needed. This requires integration with `accelerate` or `vLLM` serving
-infrastructure — both are outside the scope of this compression-focused project.
+### Quality Validation
+- Ablation study: base vs symmetric vs ITF vs ITF+outliers vs ITF+compensation
+- Perplexity on WikiText-2
+- Zero-shot accuracy (MMLU, HellaSwag, ARC)
+- Compare against PT²-LLM paper results when code is released
 
-## Pipeline
+### Symmetric Quantizer Too Slow on CPU
+`_symmetric_ternary` iterates 256 candidates × full matrix ops × 96 layers.
+CPU: ~18 min. GPU: <1 min. The ITF (closed-form, 10 iterations) is much
+faster but unstable. Fix ITF stability, then symmetric becomes unnecessary.
 
-### ParetoQ Quantization Function Search
+### Adaptive Compensation Steps
+CPU: 10 steps (~14 min). GPU: 50 steps (~3 min). Should auto-scale based
+on convergence delta, not fixed steps. Currently converges 5.84→5.72 on GPU.
 
-The ParetoQ paper describes a search over quantization functions (uniform,
-elastic, stretched-elastic, LSQ, LSQ+) per layer. The current implementation
-uses a fixed per-bit-width mapping. Implementing the full search requires:
-- Per-layer architecture analysis
-- Validation-based quantization function selection
-- Additional compute budget (≈2× training time)
+### CPU-Only Full Pipeline Time
+~22 min for 2.7B model (PT-BitNet 1.5 min + comp 14 min + Tequila 5 min).
+Acceptable for one-time compression. GPU (T4): ~8 min.
 
-### ZeroQAT Sparse Sensitive Parameters
+## Backlog
 
-The ZO fine-tuning paper (arXiv:2406.02913) identifies 0.1% "sensitive parameters"
-during pre-training. In a post-training pipeline, this identification must be
-done via gradient-based sensitivity analysis at the start of QAT:
-- Run one forward + backward pass (full precision) per layer
-- Rank parameters by gradient magnitude
-- Select top-0.1% for ZO updates
-- Requires ~1× extra forward pass cost
+### Native Inference Kernel
+Integration with `microsoft/BitNet`:
+1. Export baked weights → safetensors → `convert-helper-bitnet.py` → GGUF I2_S
+2. Call `llama-cli` binary (subprocess, no streaming) OR
+3. Write Python bindings for in-process inference
+4. Target: 3-6× CPU speedup
 
-### Activation Quantization
+### Column Reordering (SSR) — Fix or Remove
+PT²-LLM Section 3.3, Eq. 14-16. Groups similar columns for compact blocks.
+Current implementation produces incorrect inverse permutation.
+Need: unit test for round-trip (reorder → inverse → compare with original).
 
-All current stages are weight-only quantization. Activation quantization
-(8-bit or ternary activations) would further reduce memory and compute:
-- Requires quantization-aware activation functions
-- Needs calibration data for activation range estimation
-- Potential 2–4× additional speedup
+### Activation-aware Grid Alignment (AGA) — Fix or Remove
+PT²-LLM Section 3.2, Eq. 13. Minimizes ||WX - (αT+μ)X|| instead of ||W - (αT+μ)||.
+Uses calibration activations X. Currently broken on GPU (0 layers collected).
+Need: fix device handling in `_collect_activations`.
 
-### KV-Cache Compression
+### Larger Model Testing
+Current: Phi-2 (2.7B). Target: Mistral-7B, Falcon-7B, Phi-3 Medium (14B).
+Requires Colab A100 or local GPU with >24 GB VRAM.
 
-The KV cache in long-context generation dominates memory. Ternary quantization
-of KV cache entries is an orthogonal research direction:
-- Per-head quantization granularity
-- Requires modification to `DynamicCache` / `StaticCache` in transformers
-
-## Evaluation
-
-### Full Benchmark Suite
-
-Current evaluation covers MMLU, HellaSwag, ARC-Easy, and ARC-Challenge.
-Additional benchmarks desirable:
-- GSM8K (mathematical reasoning)
-- HumanEval (code generation)
-- TruthfulQA (factuality)
-- BBH (broad reasoning)
-- IFEval (instruction following)
-
-### Latency Benchmarks
-
-End-to-end latency measurement under realistic serving conditions:
-- Time-to-first-token (TTFT)
-- Inter-token latency (ITL)
-- Throughput (tokens/sec) at batch sizes 1, 4, 8
-- Requires dedicated benchmarking harness with warm-up iterations
-
-## Export
+### Benchmark Suite
+- MMLU, HellaSwag, ARC-Easy, ARC-Challenge (via lm-eval)
+- WikiText-2 perplexity
+- GSM8K, HumanEval, TruthfulQA
+- Latency: TTFT, ITL, throughput
 
 ### bitnet.cpp Python Bindings
-
-Currently calls `bitnet` binary via subprocess. Native Python bindings via
-`ctypes` or `cffi` would enable:
+Replace subprocess call with `ctypes`/`cffi` bindings for:
 - In-process streaming generation
-- Direct memory access (no serialization overhead)
+- Direct memory access
 - Batch inference
-- Depends on upstream `microsoft/BitNet` exposing a C API
 
-### GGML / llama.cpp Format
-
-In addition to bitnet.cpp, exporting to GGML format would enable inference
-on llama.cpp's broader hardware support:
-- Metal (Apple Silicon)
-- Vulkan (AMD GPUs)
-- WebAssembly (browser)
-- Requires ternary-specific changes to GGML's quantization format
+## Done
+- [x] Per-channel Lambada (6 MB vs 2.5 GB per-element)
+- [x] Sharded safetensors save (800 MB chunks, Colab-safe)
+- [x] Incremental checkpointing (stage1/2/3 markers)
+- [x] QAT removed from pipeline (incompatible with ternary, Tequila replaces it)
+- [x] PT²-LLM paper reviewed and asymmetric ITF implemented
+- [x] SpQR outlier retention (top 1% FP16)
+- [x] GPTQ-style Hessian compensation on lm_head
+- [x] tchat CLI with auto-compression
+- [x] Colab notebook with git pull

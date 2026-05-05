@@ -37,15 +37,20 @@ TernaryBoost integrates **PT-BitNet** (post-training ternary quantization with o
 
 Synthesizes post-training quantization techniques from the BitNet b1.58 framework (Ma et al., 2024). Three sub-steps execute sequentially:
 
-1. **Vectorized Ternary Optimization** — batch threshold search over 256 candidate deltas evaluated in parallel across all output channels, minimizing reconstruction error. Rows with above-median error are refined via per-row binary search.
+The core quantizer is based on **PT²-LLM** (Yan et al., ICLR 2026): an Asymmetric Ternary Quantizer with closed-form Iterative Ternary Fitting (ITF) and Activation-aware Grid Alignment (AGA). The quantizer operates on the set {-α+μ, μ, +α+μ} instead of the symmetric {-α, 0, +α}.
 
-2. **Outlier Retention** (SpQR-style, Dettmers et al., 2023) — keeps the top `outlier_fraction` (default 1%) weights per row in FP16, quantizing only the remaining 99%. Outliers selected by z-score. Controlled via `PTBitNetConfig.outlier_fraction`.
+**Active sub-steps** (executed sequentially):
+1. **Asymmetric ITF** — alternating closed-form optimization of grid (α, μ) and ternary matrix T in ~10 iterations. Each step solves a 2×2 linear system per row (PT²-LLM Eq. 9-10). Significantly faster than threshold search. Controlled via `PTBitNetConfig.asymmetric` (default True).
+2. **Outlier Retention** (SpQR-style) — top 1% weights by z-score kept in FP16.
+3. **Hessian Compensation** (GPTQ-style) — lm_head fine-tuned to absorb quantization error. Memory-efficient: forward hook captures last hidden state, only lm_head receives gradients. 50 steps GPU (~3 min, Colab loss: 5.84→5.72), 10 steps CPU (~14 min).
 
-3. **Hessian Compensation** (GPTQ-style, Frantar et al., 2023) — after quantization, the `lm_head` is fine-tuned to absorb residual error. The transformer body runs under `torch.no_grad()` (zero activation memory), and only the final projection receives gradients. A forward hook captures the last hidden state, detaches it, and runs lm_head with grad enabled — limiting the computation graph to ~100M params. Controlled via `PTBitNetConfig.compensation_steps` (default 50).
+**Experimental sub-steps** (default off):
+- **AGA** — aligns quantization with calibration activations (PT²-LLM Eq. 13). Broken on GPU (0 layers collected); under investigation.
+- **SSR** — structural column reordering (PT²-LLM Section 3.3). Produces garbled output (inverse permutation bug); disabled.
 
-Targets all linear projections in attention and MLP modules while preserving `lm_head` and `embed_tokens`. GPU (T4): ~4 min for 2.7B. CPU: ~20 min.
+Targets all linear projections in attention and MLP while preserving `lm_head` and `embed_tokens`.
 
-> "PT-BitNet" is not a published method name. It synthesizes BitNet PTQ with quality improvements from SpQR and GPTQ.
+> "PT-BitNet" is not a published method. It synthesizes BitNet PTQ with PT²-LLM, SpQR, and GPTQ.
 
 ### Stage 2 — Tequila (Deadzone Trapping Recovery)
 
@@ -166,14 +171,27 @@ python run_pipeline.py \
 
 ## Expected Results
 
-| Metric | Phi-2 (2.7B, CPU) | 7B Model (GPU T4) |
-|--------|-------------------|-------------------|
-| PT-BitNet (full) | ~20 min | ~4 min |
-| Tequila | ~2 min | ~1 min |
-| Total pipeline | ~22 min | ~5 min |
-| Disk (ternary) | ~0.5 GB | ~1.2 GB |
-| Inference speed (baked) | ~0.8 tok/s (CPU) | ~25 tok/s (GPU) |
-| Inference speed (bitnet.cpp kernel) | ~3-5 tok/s (CPU) | ~80 tok/s (GPU) |
+**Measured (Phi-2, 2.7B, local CPU / Colab T4):**
+
+| Metric | CPU (i7-12th, 15 GB) | GPU (T4, 15.6 GB) |
+|--------|----------------------|--------------------|
+| PT-BitNet (ITF 96 layers) | ~1.5 min | ~7 s |
+| Compensation (50 GPU / 10 CPU steps) | ~14 min | ~3 min |
+| Save (sharded, 5.5 GB) | ~30 s | ~14 min (Colab I/O) |
+| Tequila | ~5 min | OOM (WIP) |
+| Total pipeline | ~22 min | Incomplete |
+| Disk (ternary bf16) | ~5.5 GB | ~5.5 GB |
+| Inference speed (baked) | ~0.8 tok/s | ~25 tok/s |
+
+**Aspirational (with native kernel):**
+
+| Metric | Value |
+|--------|-------|
+| CPU inference (microsoft/BitNet GGUF I2_S) | 3-6× vs baked |
+| Disk (INT2 packed) | ~0.5 GB |
+| 7B model pipeline (GPU A100) | ~5 min est. |
+
+> **Status:** Pipeline runs to completion on CPU but output is garbled (ITF numerical instability under investigation). GPU pipeline OOMs during Tequila. Quality vs FP16 has not been validated. See TODO.md for current status.
 
 ## Repository Structure
 
@@ -186,6 +204,7 @@ ternary-boost/
 ├── configs/
 ├── scripts/
 ├── notebooks/                  # Colab demo + ablation study
+├── scripts/                    # colab_test.py (automated T4 eval)
 │
 ├── shared/                     # Checkpoint, logging, data loaders
 ├── pt_bitnet/                  # Stage 1: PTQ + outliers + compensation
