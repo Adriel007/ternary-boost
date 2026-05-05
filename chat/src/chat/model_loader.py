@@ -482,10 +482,6 @@ def _compress_and_cache(
     if not _stage_done(cache_dir, 3):
         logger.info("=" * 50)
         logger.info("Stage 3/3: Tequila deadzone trapping")
-        # Free GPU memory from save before loading Tequila
-        if has_cuda:
-            torch.cuda.empty_cache()
-            logger.info(f"  GPU memory before Tequila: {torch.cuda.memory_allocated()/1e9:.2f}GB allocated")
         t0 = time.time()
         texts_data = _ensure_texts()
         tequila_dataloader = create_calibration_dataloader(tokenizer, texts_data[:50], batch_size=2, max_length=128)

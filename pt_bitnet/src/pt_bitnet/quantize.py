@@ -591,8 +591,7 @@ def hessian_compensation(
             logger.info(f"  Compensation step {step + 1}/{config.compensation_steps} - loss: {avg_loss:.4f}")
 
     hook_handle.remove()
-    if has_cuda and original_device.type == "cpu":
-        model.cpu()
+    # Keep model on GPU if that's where it was trained (avoids CPU RAM spike)
     for param in model.parameters():
         param.requires_grad = False
 
