@@ -1,0 +1,341 @@
+"""LoRA fine-tuning for ternary-quantized models.
+
+Adds small trainable rank-decomposition adapters to frozen ternary weights
+and fine-tunes them with knowledge distillation from the FP16 teacher.
+
+Memory-efficient: only LoRA params receive gradients. The ternary backbone
+and FP16 teacher are frozen, keeping VRAM usage low enough for T4 Colab.
+
+QLoRA (Dettmers et al., 2023) proved this works for 4-bit. We adapt it
+for 1.58-bit ternary, where the quantization error is larger but LoRA
+with sufficient rank compensates.
+"""
+
+import gc
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import PreTrainedModel, PreTrainedTokenizer
+
+from shared.logging import get_logger
+
+logger = get_logger("pt_bitnet.lora")
+
+
+@dataclass
+class LoRAConfig:
+    """Configuration for LoRA fine-tuning on ternary models."""
+
+    rank: int = 32                # LoRA rank (higher = more expressive, more memory)
+    alpha: float = 64.0           # Scaling factor (alpha/rank scales LoRA output)
+    dropout: float = 0.05         # LoRA dropout for regularization
+    target_modules: tuple = (
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    )
+    skip_modules: tuple = ("lm_head", "embed_tokens")
+
+    # Fine-tuning
+    num_steps: int = 500          # Total optimization steps
+    batch_size: int = 2           # Per-step batch size
+    learning_rate: float = 2e-4   # AdamW learning rate
+    max_seq_length: int = 128     # Max sequence length for calibration
+    gradient_accumulation: int = 4 # Accumulate batches before step
+
+    # Knowledge distillation
+    distill_weight: float = 0.5   # Weight of KD loss vs CE loss (0-1)
+    temperature: float = 3.0      # KD temperature (higher = softer targets)
+
+
+class LoRALinear(nn.Module):
+    """Wraps a frozen ternary nn.Linear with a trainable LoRA adapter.
+
+    Forward: y = linear(x, W_ternary) + (alpha/rank) * linear(linear(x, A), B)
+
+    Where A is [rank, in_features] and B is [out_features, rank].
+    Only A and B receive gradients; W_ternary stays frozen.
+    """
+
+    def __init__(self, base: nn.Linear, config: LoRAConfig):
+        super().__init__()
+        self.base = base           # Frozen ternary weight
+        self.rank = config.rank
+        self.alpha = config.alpha
+        self.scaling = config.alpha / config.rank
+        self.dropout = nn.Dropout(config.dropout)
+
+        in_f = base.in_features
+        out_f = base.out_features
+
+        # A: maps input to low-rank space [rank, in_f]
+        self.lora_A = nn.Parameter(torch.randn(config.rank, in_f) * 0.02)
+        # B: maps low-rank back to output [out_f, rank]
+        self.lora_B = nn.Parameter(torch.zeros(out_f, config.rank))
+
+        # Freeze base
+        for p in self.base.parameters():
+            p.requires_grad = False
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        # Ternary base forward (frozen) — pass kwargs for attention_mask etc.
+        base_out = self.base(x) if not kwargs else self.base(x, **kwargs)
+
+        # LoRA forward: x @ A.T @ B.T
+        lora_out = self.scaling * (self.dropout(x) @ self.lora_A.T @ self.lora_B.T)
+
+        return base_out + lora_out
+
+    @property
+    def weight(self):
+        """Proxy .weight so HF model introspection works."""
+        return self.base.weight
+
+
+def _add_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
+    """Replace target nn.Linear layers with LoRALinear wrappers.
+
+    Only wraps layers that are already ternary (nn.Linear with
+    requires_grad=False weights). Keeps original layers for lm_head,
+    embed_tokens, and any non-target modules.
+    """
+    replaced = 0
+    for module_name, module in list(model.named_modules()):
+        if any(skip in module_name for skip in config.skip_modules):
+            continue
+        if not any(target in module_name for target in config.target_modules):
+            continue
+        if not isinstance(module, nn.Linear):
+            continue
+        # Only wrap if weight is frozen (ternary quantized)
+        if module.weight.requires_grad:
+            continue
+
+        parent_name = ".".join(module_name.split(".")[:-1])
+        child_name = module_name.split(".")[-1]
+        parent = model if not parent_name else model.get_submodule(parent_name)
+
+        lora_layer = LoRALinear(module, config)
+        setattr(parent, child_name, lora_layer)
+        replaced += 1
+
+    logger.info(f"  LoRA: wrapped {replaced} layers with LoRALinear (rank={config.rank})")
+    return model
+
+
+def _get_lora_params(model: nn.Module) -> list[nn.Parameter]:
+    """Collect all LoRA trainable parameters."""
+    params = []
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            params.extend([m.lora_A, m.lora_B])
+    return params
+
+
+def finetune_lora(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    calibration_texts: list[str],
+    teacher_model: Optional[PreTrainedModel] = None,
+    config: Optional[LoRAConfig] = None,
+) -> PreTrainedModel:
+    """Fine-tune LoRA adapters on a ternary model with knowledge distillation.
+
+    The ternary backbone stays frozen. Only LoRA matrices (A, B) receive
+    gradients. A frozen FP16 teacher provides soft targets via KL divergence.
+
+    Memory: model (ternary, frozen) + teacher (FP16, frozen) + LoRA params.
+    For Phi-2 on T4: ~11 GB + 0.4 GB = ~11.4 GB (fits 15.6 GB VRAM).
+    """
+    if config is None:
+        config = LoRAConfig()
+
+    has_cuda = torch.cuda.is_available()
+    device = next(model.parameters()).device
+
+    # ── Add LoRA adapters ────────────────────────────────────────
+    model = _add_lora_to_model(model, config)
+    model.train()
+
+    # Only LoRA params are trainable
+    lora_params = _get_lora_params(model)
+    total_lora = sum(p.numel() for p in lora_params)
+    logger.info(f"  LoRA trainable params: {total_lora:,} "
+                f"({total_lora * 4 / 1e6:.1f} MB fp32)")
+
+    # ── Optimizer & scheduler ────────────────────────────────────
+    optimizer = torch.optim.AdamW(lora_params, lr=config.learning_rate,
+                                  weight_decay=0.01, betas=(0.9, 0.999))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.num_steps, eta_min=config.learning_rate * 0.1,
+    )
+
+    # ── Teacher setup ────────────────────────────────────────────
+    teacher = teacher_model
+    if teacher is not None:
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+        logger.info("  Teacher (FP16): frozen for knowledge distillation")
+
+    # ── Fine-tuning loop ─────────────────────────────────────────
+    total_loss_ema = 0.0
+    best_loss = float("inf")
+    optimizer.zero_grad()
+
+    for step in range(config.num_steps):
+        # Cycle through calibration texts
+        text_idx = step % len(calibration_texts)
+        text = calibration_texts[text_idx]
+
+        inputs = tokenizer(text, return_tensors="pt", truncation=True,
+                           max_length=config.max_seq_length)
+        input_ids = inputs["input_ids"].to(device)
+        if input_ids.numel() < 2:
+            continue
+
+        # ── Forward ──────────────────────────────────────────
+        # Student forward (ternary + LoRA)
+        student_out = model(input_ids=input_ids, labels=input_ids)
+        ce_loss = student_out.loss
+
+        # Teacher forward (FP16, no grad)
+        distill_loss = torch.tensor(0.0, device=device)
+        if teacher is not None:
+            with torch.no_grad():
+                teacher_out = teacher(input_ids=input_ids)
+            # KL divergence on logits
+            T = config.temperature
+            student_log_probs = F.log_softmax(student_out.logits / T, dim=-1)
+            teacher_probs = F.softmax(teacher_out.logits / T, dim=-1)
+            distill_loss = F.kl_div(student_log_probs, teacher_probs,
+                                    reduction="batchmean") * (T * T)
+
+        # Combined loss
+        beta = config.distill_weight if teacher is not None else 0.0
+        loss = (1.0 - beta) * ce_loss + beta * distill_loss
+        loss = loss / config.gradient_accumulation
+        loss.backward()
+
+        # ── Optimization step ────────────────────────────────
+        if (step + 1) % config.gradient_accumulation == 0:
+            torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        # ── Logging ──────────────────────────────────────────
+        total_loss_ema = 0.95 * total_loss_ema + 0.05 * loss.item()
+        if step == 0 or (step + 1) % max(1, config.num_steps // 10) == 0:
+            lr = scheduler.get_last_lr()[0]
+            logger.info(
+                f"  LoRA step {step + 1}/{config.num_steps} "
+                f"loss={total_loss_ema:.4f} ce={ce_loss.item():.4f} "
+                f"kd={distill_loss.item():.4f} lr={lr:.2e}"
+            )
+
+        # Track best
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+
+    # ── Finalize ─────────────────────────────────────────────────
+    model.eval()
+    logger.info(f"  LoRA fine-tuning complete. Best loss: {best_loss:.4f}")
+
+    # Clean up teacher to free VRAM
+    if teacher is not None:
+        del teacher
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return model
+
+
+def merge_lora_to_weights(model: nn.Module) -> nn.Module:
+    """Merge LoRA adapters back into the base ternary weights.
+
+    W_merged = W_ternary + (alpha/rank) * (B @ A)
+
+    After merging, replaces LoRALinear with standard nn.Linear.
+    NOTE: this destroys ternary sparsity — the merged weight is dense.
+    Use only if you prioritize quality over ternary efficiency, or if
+    you plan to re-quantize after merging.
+    """
+    merged = 0
+    for module_name, module in list(model.named_modules()):
+        if not isinstance(module, LoRALinear):
+            continue
+
+        # Compute effective weight with LoRA contribution
+        with torch.no_grad():
+            w_base = module.base.weight.data.float()
+            lora_contrib = module.scaling * (module.lora_B.data.float() @
+                                             module.lora_A.data.float())
+            w_merged = w_base + lora_contrib
+
+        parent_name = ".".join(module_name.split(".")[:-1])
+        child_name = module_name.split(".")[-1]
+        parent = model if not parent_name else model.get_submodule(parent_name)
+
+        device = module.base.weight.device
+        dtype = module.base.weight.dtype
+        new_linear = nn.Linear(
+            module.base.in_features, module.base.out_features,
+            bias=module.base.bias is not None, dtype=dtype, device=device,
+        )
+        new_linear.weight.data.copy_(w_merged.to(device).to(dtype))
+        if module.base.bias is not None:
+            new_linear.bias.data.copy_(module.base.bias.data)
+
+        setattr(parent, child_name, new_linear)
+        merged += 1
+
+    logger.info(f"  Merged {merged} LoRA adapters → nn.Linear (dense, non-ternary)")
+    return model
+
+
+def save_lora_weights(model: nn.Module, path: str) -> None:
+    """Save only LoRA weights (A, B matrices) to a safetensors file."""
+    from safetensors.torch import save_file
+
+    lora_weights = {}
+    for name, param in model.named_parameters():
+        if "lora_A" in name or "lora_B" in name:
+            lora_weights[name] = param.detach().cpu()
+
+    if lora_weights:
+        save_file(lora_weights, path)
+        logger.info(f"  Saved {len(lora_weights)} LoRA tensors to {path}")
+    else:
+        logger.warning("  No LoRA tensors found to save")
+
+
+def load_lora_weights(model: nn.Module, path: str) -> None:
+    """Load LoRA weights from safetensors into model's LoRA adapters."""
+    from safetensors.torch import load_file
+
+    lora_weights = load_file(path)
+    loaded = 0
+    for name, param in model.named_parameters():
+        if name in lora_weights:
+            param.data.copy_(lora_weights[name].to(param.device))
+            loaded += 1
+    logger.info(f"  Loaded {loaded}/{len(lora_weights)} LoRA tensors")
+
+
+def count_lora_params(model: nn.Module) -> dict:
+    """Count trainable vs frozen parameters for logging."""
+    lora_trainable = sum(
+        p.numel() for m in model.modules()
+        if isinstance(m, LoRALinear)
+        for p in [m.lora_A, m.lora_B]
+    )
+    total = sum(p.numel() for p in model.parameters())
+    return {
+        "total_params": total,
+        "lora_trainable": lora_trainable,
+        "lora_ratio": lora_trainable / total if total > 0 else 0.0,
+    }

@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import time
+import gc
 from pathlib import Path
 from typing import Optional
 
@@ -510,15 +511,90 @@ def _compress_and_cache(
         logger.info("Stage 3/3: Tequila [SKIPPED]")
         model, tokenizer = _load_model_state(cache_dir, entry)
 
+    # Stage 4: LoRA fine-tuning (quality recovery)
+    # Adds small trainable rank-decomposition adapters on top of frozen
+    # ternary weights. Fine-tuned with knowledge distillation from the
+    # FP16 teacher. LoRA weights are saved separately — the ternary
+    # backbone stays untouched for fast inference.
+    # Set lora_rank=0 in ModelEntry to skip.
+    lora_rank = getattr(entry, "lora_rank", 0)
+    if lora_rank > 0 and not _stage_done(cache_dir, 4):
+        logger.info("=" * 50)
+        logger.info(f"Stage 4/4: LoRA fine-tuning (rank={lora_rank}, quality recovery)")
+        t0 = time.time()
+
+        # Check if teacher + student fit in VRAM
+        if has_cuda:
+            vram_free = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+            est_teacher = sum(p.numel() for p in model.parameters()) * 2  # bf16 bytes
+            if vram_free < est_teacher * 1.5:
+                logger.warning(f"  Insufficient VRAM for teacher + student "
+                               f"(free={vram_free/1e9:.1f} GB, need ~{est_teacher*2.5/1e9:.1f} GB)")
+                logger.warning(f"  Skipping LoRA — use a larger GPU or set lora_rank=0")
+                _mark_stage_done(cache_dir, 4, 0)
+            else:
+                from pt_bitnet.lora import finetune_lora, LoRAConfig
+
+                logger.info("  Loading FP16 teacher for distillation...")
+                from transformers import AutoConfig
+                teacher_config = AutoConfig.from_pretrained(
+                    entry.path, trust_remote_code=True, cache_dir=str(hf_cache),
+                )
+                if not hasattr(teacher_config, "pad_token_id") or teacher_config.pad_token_id is None:
+                    teacher_config.pad_token_id = 0
+                teacher = AutoModelForCausalLM.from_pretrained(
+                    entry.path, torch_dtype=dtype, low_cpu_mem_usage=True,
+                    device_map="cpu", trust_remote_code=True, cache_dir=str(hf_cache),
+                    config=teacher_config,
+                )
+                if has_cuda:
+                    teacher.cuda()
+
+                texts_data = _ensure_texts()
+                lo_cfg = LoRAConfig(
+                    rank=lora_rank,
+                    num_steps=getattr(entry, "lora_steps", 500),
+                    distill_weight=0.5,
+                )
+                model = finetune_lora(model, tokenizer, texts_data[:50], teacher, lo_cfg)
+
+                del teacher; gc.collect()
+                if has_cuda:
+                    torch.cuda.empty_cache()
+
+                from pt_bitnet.lora import save_lora_weights
+                save_lora_weights(model, str(cache_dir / "lora_weights.safetensors"))
+
+                elapsed = time.time() - t0
+                logger.info(f"LoRA fine-tuning complete in {elapsed:.1f}s")
+                _mark_stage_done(cache_dir, 4, elapsed)
+        else:
+            logger.info("  LoRA requires GPU — skipping on CPU")
+            _mark_stage_done(cache_dir, 4, 0)
+    elif lora_rank == 0:
+        logger.info("Stage 4/4: LoRA [SKIPPED — lora_rank=0]")
+        if not _stage_done(cache_dir, 4):
+            _mark_stage_done(cache_dir, 4, 0)
+    else:
+        logger.info("Stage 4/4: LoRA [SKIPPED]")
+        # Try loading LoRA weights if they exist
+        lora_path = cache_dir / "lora_weights.safetensors"
+        if lora_path.exists() and not any("lora" in n for n, _ in model.named_parameters()):
+            from pt_bitnet.lora import LoRAConfig, _add_lora_to_model, load_lora_weights
+            _add_lora_to_model(model, LoRAConfig())
+            load_lora_weights(model, str(lora_path))
+            logger.info("  Loaded LoRA weights from cache")
+        else:
+            model, tokenizer = _load_model_state(cache_dir, entry)
+
     # Final metadata
     total_time = time.time() - total_start
     meta = {
         "source_model": entry.path, "pipeline_version": "1.0",
         "total_time_s": total_time,
-        "stages_applied": ["pt_bitnet"],
+        "stages_applied": ["pt_bitnet", "lora"],
         "params": sum(p.numel() for p in model.parameters()),
         "device": "GPU" if has_cuda else "CPU",
-        "lambada_granularity": getattr(entry, "lambada_granularity", "per_channel"),
     }
     (cache_dir / "pipeline_metadata.json").write_text(json.dumps(meta, indent=2))
     logger.info(f"Pipeline complete in {total_time:.0f}s — cached at {cache_dir}")

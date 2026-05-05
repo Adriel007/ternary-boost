@@ -24,6 +24,8 @@ class ModelEntry:
     top_k: int = 50
     repetition_penalty: float = 1.1
     lambada_granularity: str = "per_channel"  # "per_channel" or "per_element"
+    lora_rank: int = 32       # LoRA rank (0 = disable LoRA fine-tuning)
+    lora_steps: int = 500     # LoRA optimization steps
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}

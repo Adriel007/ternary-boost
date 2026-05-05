@@ -20,10 +20,16 @@ os.environ.setdefault("HF_HOME", "/content/cache/huggingface")
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIG — change MODEL here
 # ═══════════════════════════════════════════════════════════════════════
-# microsoft/phi-2          — 2.7B, fits T4, fast (10 min pipeline)
+# microsoft/phi-2          — 2.7B, fits T4, fast (~20 min with LoRA)
 # mistralai/Mistral-7B-v0.1 — 7.2B, needs A100/L4 (24+ GB VRAM)
 # Qwen/Qwen2.5-7B          — 7.6B, needs A100/L4
-MODEL = "mistralai/Mistral-7B-v0.1"
+MODEL = "microsoft/phi-2"
+
+# LoRA fine-tuning (quality recovery after ternary quantization)
+# rank=32: good balance of quality/speed. Higher = better but slower.
+ENABLE_LORA = True
+LORA_RANK = 32
+LORA_STEPS = 500       # Reduce to 200 for quick test, 500+ for best quality
 # ═══════════════════════════════════════════════════════════════════════
 
 # ── Setup ──────────────────────────────────────────────────────────
@@ -273,6 +279,8 @@ print(f"\n{'='*60}\nPipeline: {MODEL}\n{'='*60}")
 entry = ModelEntry(
     name=MODEL_NAME, path=MODEL, device=device,
     lambada_granularity="per_channel",
+    lora_rank=LORA_RANK if ENABLE_LORA else 0,
+    lora_steps=LORA_STEPS,
 )
 
 t0 = time.time()

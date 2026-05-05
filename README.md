@@ -10,24 +10,24 @@
 
 ## Abstract
 
-TernaryBoost compresses any HuggingFace causal LM to 1.58-bit ternary representation via **PT-BitNet**: symmetric ternary quantization with 1% outlier retention (SpQR-style) and Hessian compensation on lm_head (GPTQ-style). The pipeline auto-detects GPU/CPU, checkpoints incrementally, and produces a standard HuggingFace-compatible checkpoint. An interactive chat CLI (`tchat`) provides immediate access to compressed models.
+TernaryBoost compresses any HuggingFace causal LM to 1.58-bit ternary representation via **PT-BitNet** (symmetric ternary quantization with outlier retention and Hessian compensation) followed by **LoRA fine-tuning** (knowledge distillation from the FP16 teacher to recover quality). The pipeline auto-detects GPU/CPU, checkpoints incrementally, and produces a standard HuggingFace-compatible checkpoint with optional LoRA adapters. An interactive chat CLI (`tchat`) provides immediate access to compressed models.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────┐    ┌─────────────────┐    ┌──────────────┐
-│  FP16 Model  │───▶│ PT-BitNet       │───▶│ Save          │
-│  (HF Hub)    │    │ Symmetric Tern. │    │ Sharded       │
-└──────────────┘    │ + 1% Outliers   │    │ Safetensors   │
-                    │ + Hessian Comp. │    └──────┬───────┘
-                    └─────────────────┘           ▼
-                                            ┌──────────────┐
-                                            │ tchat CLI     │
-                                            │ Interactive   │
-                                            │ Chat Interface│
-                                            └──────────────┘
+┌──────────────┐    ┌─────────────────┐    ┌──────────────┐    ┌──────────────┐
+│  FP16 Model  │───▶│ PT-BitNet       │───▶│ LoRA FT       │───▶│ Save         │
+│  (HF Hub)    │    │ Symmetric Tern. │    │ Rank Decomp.  │    │ Sharded      │
+└──────────────┘    │ + 1% Outliers   │    │ + KD Teacher  │    │ Safetensors  │
+                    │ + Hessian Comp. │    │ (Quality Rec.) │    └──────┬───────┘
+                    └─────────────────┘    └──────────────┘           ▼
+                                                                 ┌──────────────┐
+                                                                 │ tchat CLI     │
+                                                                 │ Interactive   │
+                                                                 │ Chat Interface│
+                                                                 └──────────────┘
 ```
 
 ## Components
@@ -43,6 +43,35 @@ Synthesizes post-training quantization techniques from the BitNet b1.58 framewor
 Targets all linear projections in attention and MLP while preserving `lm_head` and `embed_tokens`.
 
 > "PT-BitNet" is not a published method. It synthesizes BitNet PTQ with PT²-LLM, SpQR, and GPTQ.
+
+### Stage 2 — LoRA Fine-Tuning (Quality Recovery)
+
+After ternary quantization, small **LoRA** (Low-Rank Adaptation) adapters are added to the frozen ternary weights and fine-tuned with knowledge distillation from the original FP16 model. This recovers quality lost during quantization without touching the ternary backbone.
+
+**How it works:**
+- Rank-decomposition matrices A [rank × in_f] and B [out_f × rank] added to each target layer
+- Ternary base weights stay frozen (preserves sparsity)
+- Only LoRA matrices trained (~0.5% of original parameters)
+- FP16 teacher provides soft targets via KL divergence
+- LoRA weights saved separately from ternary weights
+
+**Memory:** Teacher + student on GPU simultaneously. Phi-2 (2.7B): ~13 GB fits T4. 7B models: requires 24+ GB VRAM or CPU-offloaded teacher.
+
+**Configuration** (`ModelEntry`):
+```python
+lora_rank: int = 32       # 0 = skip LoRA, 16-64 recommended
+lora_steps: int = 500     # Optimization steps (200 fast, 500+ better)
+```
+
+Implementation: [`pt_bitnet/src/pt_bitnet/lora.py`](pt_bitnet/src/pt_bitnet/lora.py)
+
+### Block-wise STE Fine-Tuning (Experimental)
+
+An alternative quality recovery method: fine-tune ternary weights directly using Straight-Through Estimator (STE) gradients, one transformer block at a time. Matches hidden states against the FP16 teacher.
+
+Implementation: [`pt_bitnet/src/pt_bitnet/ste.py`](pt_bitnet/src/pt_bitnet/ste.py)
+
+**Status:** Implemented but untested. LoRA is the recommended approach — it's more stable and backed by the QLoRA literature.
 
 ### Tequila (Research Artifact — Removed from Pipeline)
 
@@ -153,6 +182,8 @@ python run_pipeline.py \
 | **Disk** | 5.6 GB | 5.6 GB | — |
 
 **Verdict: GOOD** — minor perplexity loss (32%), identical generation quality, no degeneration. Post-training ternary on small models (2.7B) is inherently harder due to less parameter redundancy. PT²-LLM reports 1.15-1.25x PPL ratios on 7-70B models.
+
+**With LoRA (rank=32, 500 steps):** Pending Colab run. Expected PPL ratio improvement from 1.32x → 1.05-1.15x based on QLoRA literature (LoRA on quantized weights recovers quality proportional to rank). LoRA adds ~0.5% trainable parameters and ~10 min to pipeline time.
 
 Full results and sample outputs: [`results/phi2_ternary.md`](results/phi2_ternary.md)
 
