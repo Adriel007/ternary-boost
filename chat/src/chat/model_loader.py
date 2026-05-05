@@ -410,9 +410,7 @@ def _compress_and_cache(
     _ensure_pipeline_imports()
 
     from pt_bitnet import apply_pt_bitnet, PTBitNetConfig
-    from paretoq import apply_paretoq_qat, ZeroQATConfig
-    from tequila import apply_tequila, TequilaConfig
-    from shared.data import load_calibration_texts, create_qat_dataloader, create_calibration_dataloader
+    from shared.data import load_calibration_texts
 
     has_cuda = torch.cuda.is_available()
     logger.info(f"Device: {'GPU' if has_cuda else 'CPU'}")
@@ -473,7 +471,7 @@ def _compress_and_cache(
             model,
             PTBitNetConfig(block_size=128, outlier_clip_threshold=3.0,
                            outlier_fraction=0.01, compensation_steps=comp_steps,
-                           asymmetric=True),   # PT²-LLM ITF: closed-form, no clamping
+                           asymmetric=False),  # Symmetric: ITF incompatible with outliers
             tokenizer=tokenizer,
             calibration_texts=_ensure_texts()[:32],
         )
@@ -496,24 +494,18 @@ def _compress_and_cache(
         logger.info("Stage 2/3: ParetoQ/ZeroQAT [SKIPPED]")
         model, tokenizer = _load_model_state(cache_dir, entry)
 
-    # Stage 3: Tequila
+    # Stage 3: Tequila intentionally skipped.
+    # PT-BitNet denormalizes weights (w*std + mean), shifting them away from
+    # zero. UltraQuantV3 recomputes the ternary decomposition from scratch
+    # using its own threshold (mean(|w|)/2), which produces a DIFFERENT
+    # ternary pattern than PT-BitNet. Combined with the incorrect baking
+    # formula that was present in earlier versions, this destroyed quality.
+    # PT-BitNet sym+comp alone is sufficient — ablation proves it matches
+    # FP16 output. Tequila code is retained in tequila/ as a research
+    # artifact for future quantization-aware training.
     if not _stage_done(cache_dir, 3):
-        logger.info("=" * 50)
-        logger.info("Stage 3/3: Tequila deadzone trapping")
-        t0 = time.time()
-        texts_data = _ensure_texts()
-        tequila_dataloader = create_calibration_dataloader(tokenizer, texts_data[:50], batch_size=2, max_length=128)
-        tequila_config = TequilaConfig(
-            quant_method="ultraquantv3", num_epochs=1, range_of_lambada=0.01,
-            lambada_granularity=getattr(entry, "lambada_granularity", "per_channel"),
-        )
-        model = apply_tequila(model, tequila_dataloader, tequila_config)
-        elapsed = time.time() - t0
-        logger.info(f"Tequila complete in {elapsed:.1f}s")
-        # Bake UltraQuantLinear → nn.Linear for fast inference
-        _bake_ultraquant_to_linear(model)
-        _save_model_state(model, tokenizer, cache_dir)
-        _mark_stage_done(cache_dir, 3, elapsed)
+        logger.info("Stage 3/3: Tequila [SKIPPED — PT-BitNet denorm incompatible with UltraQuantV3 re-decomposition]")
+        _mark_stage_done(cache_dir, 3, 0)
     else:
         logger.info("Stage 3/3: Tequila [SKIPPED]")
         model, tokenizer = _load_model_state(cache_dir, entry)
@@ -523,7 +515,7 @@ def _compress_and_cache(
     meta = {
         "source_model": entry.path, "pipeline_version": "1.0",
         "total_time_s": total_time,
-        "stages_applied": ["pt_bitnet", "paretoq_zeroqat", "tequila"],
+        "stages_applied": ["pt_bitnet"],
         "params": sum(p.numel() for p in model.parameters()),
         "device": "GPU" if has_cuda else "CPU",
         "lambada_granularity": getattr(entry, "lambada_granularity", "per_channel"),
