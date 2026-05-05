@@ -2,34 +2,27 @@
 
 ## Critical (pipeline doesn't work end-to-end)
 
-### ITF Numerical Stability
-The asymmetric `build_optimal_grid` produces extreme alpha/mu values for
-degenerate rows (T all-zero or all-same-sign). Current fix clamps alpha to
-[0.1×init, 10×init] and mu to [init-3α, init+3α], but this hasn't been
-validated end-to-end. Need: proper bounds testing + fallback to symmetric
-for unstable rows.
+### Save/Load/Bake Round-Trip Corrupts Quality — FOUND 2026-05-05
+**Ablation on Colab T4 proved:** All 5 quantization variants (symmetric,
+ITF, +outliers, +compensation) correctly answer "Paris":
+```
+BASE:      "Paris." ✅
+SYMMETRIC: "The city of Paris is located in France." ✅
+SYM+COMP:  "The capital of France is Paris." ✅ (best)
+ITF:       "The city of Paris is a densely populated city..." ✅
+ITF+COMP:  "The capital of France is Paris." ✅ (best)
+```
+**But the full tchat pipeline (PT-BitNet → Tequila → Bake → Save → Load → Chat)
+produces garbage.** The quantization itself is validated. The bug is in
+one of: Tequila layer replacement, baking effective_weight computation,
+sharded save/load round-trip, or layer reconstruction.
 
-### SSR Column Permutation Bug
-`structural_similarity_reorder` reorders columns before quantization but
-the inverse permutation is likely incorrect. Output was garbled when SSR
-was enabled. Currently **disabled**. Either fix inverse permutation or
-remove SSR permanently.
-
-### AGA Activation Collection Broken on GPU
-`_collect_activations` registers hooks on nn.Linear but collected 0 layers
-on T4 (Colab). Hooks fire on forward pass but model device vs input device
-mismatch may cause silent failure. Either fix device handling or skip AGA.
-
-### Colab T4 OOM During Tequila
-Pipeline works through PT-BitNet + compensation (loss 5.72, 185s on T4)
-but OOMs when Tequila starts. 15.6 GB VRAM filled by model (11 GB) +
-optimizer states + forward activations. Need: memory profiling, model.cpu()
-before save then back to GPU for Tequila.
-
-### No Successful End-to-End Run
-Pipeline has never completed a full run producing valid output. Base FP16
-Phi-2 correctly answers "Paris" with "Question:...\nAnswer:" format but
-ternary model output is garbage. Root cause: ITF numerical instability.
+### ITF Falls Back to Symmetric for ALL Layers with Outliers
+When `outlier_fraction=0.01`, ITF produces extreme values for 96/96 layers
+and falls back to symmetric. Reason: outliers create large weight magnitudes
+that destabilize the closed-form grid optimization. Without outliers,
+ITF works perfectly (test 4). Fix: apply outlier retention BEFORE ITF,
+not during.
 
 ### No Native Kernel Integration
 Baked nn.Linear weights are ternary but inference uses float matmul

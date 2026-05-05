@@ -286,7 +286,7 @@ def ternary_quantize_vectorized(
     w = weight.float()
     out_f, in_f = w.shape
 
-    # --- Outlier identification (SpQR-style) ---
+    # --- Outlier identification (SpQR-style) — MUST run BEFORE ITF ---
     if config.outlier_fraction > 0:
         w_abs = w.abs()
         row_mean = w_abs.mean(dim=-1, keepdim=True)
@@ -299,37 +299,35 @@ def ternary_quantize_vectorized(
     else:
         outlier_mask = torch.zeros_like(w, dtype=torch.bool)
 
-    # --- ITF on non-outlier weights ---
-    w_quant = w.clone()
-    w_quant[outlier_mask] = 0  # Zero out outliers temporarily
+    # Remove outliers before quantization (they destabilize ITF closed-form)
+    w_clean = w.clone()
+    w_clean[outlier_mask] = 0
 
     if config.asymmetric:
-        alpha, mu, T = iterative_ternary_fitting(w_quant, config)
+        alpha, mu, T = iterative_ternary_fitting(w_clean, config)
 
         # --- AGA: refine grid with calibration inputs ---
         if calibration_inputs is not None:
             alpha, mu = activation_aware_grid_alignment(
-                w_quant, T, calibration_inputs, alpha, mu)
+                w_clean, T, calibration_inputs, alpha, mu)
 
-        # Reconstruct: Ŵ = αT + μ
         reconstructed = alpha * T + mu
     else:
-        # Symmetric fallback (legacy)
-        reconstructed = _symmetric_ternary(w_quant, config)
+        reconstructed = _symmetric_ternary(w_clean, config)
 
-    # Merge outliers back
+    # Merge outliers back (kept in FP16)
     reconstructed[outlier_mask] = w[outlier_mask]
 
     # Safety: if reconstruction produced NaN/Inf, fall back to symmetric
     if not torch.isfinite(reconstructed).all():
         logger.warning(f"  ITF produced non-finite values — falling back to symmetric")
-        reconstructed = _symmetric_ternary(w_quant, config)
+        reconstructed = _symmetric_ternary(w_clean, config)
         reconstructed[outlier_mask] = w[outlier_mask]
 
     # Safety: if alpha/mu exploded (extreme values), fall back
     if reconstructed.abs().max() > 1e6:
         logger.warning(f"  ITF produced extreme values — falling back to symmetric")
-        reconstructed = _symmetric_ternary(w_quant, config)
+        reconstructed = _symmetric_ternary(w_clean, config)
         reconstructed[outlier_mask] = w[outlier_mask]
 
     return reconstructed
@@ -402,7 +400,7 @@ def apply_pt_bitnet(
             device = w.device
 
             # Move to GPU for speed if available
-            w_quant = w.cuda() if torch.cuda.is_available() else w
+            w_clean = w.cuda() if torch.cuda.is_available() else w
 
             # Get calibration inputs for this layer (for AGA)
             calib_in = calibration_acts.get(name) if calibration_acts else None
@@ -410,9 +408,9 @@ def apply_pt_bitnet(
                 calib_in = calib_in.cuda()
 
                     # Normalize before quantization
-            w_mean = w_quant.mean(dim=-1, keepdim=True)
-            w_std = w_quant.std(dim=-1, keepdim=True).clamp_min(1e-8)
-            w_norm = (w_quant - w_mean) / w_std
+            w_mean = w_clean.mean(dim=-1, keepdim=True)
+            w_std = w_clean.std(dim=-1, keepdim=True).clamp_min(1e-8)
+            w_norm = (w_clean - w_mean) / w_std
             w_norm = w_norm.clamp(-config.outlier_clip_threshold, config.outlier_clip_threshold)
 
             # PT²-LLM quantization (no SSR — SSR needs debugging, see TODO)

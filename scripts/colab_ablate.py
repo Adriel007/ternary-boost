@@ -86,6 +86,29 @@ m = apply_pt_bitnet(m, cfg5, tokenizer=t, calibration_texts=["The capital of Fra
 results["itf+comp"] = test(m, t, "itf+comp")
 del m; torch.cuda.empty_cache()
 
+# ── 6. SYMMETRIC + TEQUILA + BAKE (full pipeline, no save/load) ──
+print("\n" + "="*50 + "\n6. Symmetric + Tequila + Bake (no save/load)\n" + "="*50)
+m, t = load_base()
+cfg6 = PTBitNetConfig(asymmetric=False, outlier_fraction=0.01, compensation_steps=0, show_progress=False)
+m = apply_pt_bitnet(m, cfg6)
+from tequila.ultraquant import apply_tequila, TequilaConfig
+from torch.utils.data import DataLoader
+
+class DS(torch.utils.data.Dataset):
+    def __init__(self, texts, tok):
+        self.d = [tok(x, truncation=True, max_length=64, return_tensors="pt") for x in texts]
+    def __len__(self): return len(self.d)
+    def __getitem__(self, i): return self.d[i]
+
+texts = ["The capital of France is Paris. " * 5] * 30
+dl = DataLoader(DS(texts, t), batch_size=1, shuffle=True,
+    collate_fn=lambda b: {"input_ids": torch.cat([x["input_ids"] for x in b])})
+m = apply_tequila(m, dl, TequilaConfig(quant_method="ultraquantv3", num_epochs=1, lambada_granularity="per_channel"))
+from chat.model_loader import _bake_ultraquant_to_linear
+_bake_ultraquant_to_linear(m)
+results["sym+teq+bake"] = test(m, t, "sym+teq+bake")
+del m; torch.cuda.empty_cache()
+
 # ── SUMMARY ──
 print("\n" + "="*50)
 print("SUMMARY")

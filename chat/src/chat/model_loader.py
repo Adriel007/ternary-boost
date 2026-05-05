@@ -328,10 +328,12 @@ def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
         for k in keys:
             weight_map[k] = fname
 
-    # Save custom params as a single file (always small)
-    from safetensors.torch import save_file
+    # Save or remove custom params
+    cp_path = str(cache_dir / "custom_params.safetensors")
     if custom_params:
-        save_file(custom_params, str(cache_dir / "custom_params.safetensors"))
+        save_file(custom_params, cp_path)
+    elif os.path.exists(cp_path):
+        os.remove(cp_path)  # Clean stale custom_params from previous failed runs
 
     # Fix the "XXXXX" placeholder in shard filenames
     total_shards = len(shard_files)
