@@ -442,7 +442,7 @@ def _compress_and_cache(
             model,
             PTBitNetConfig(block_size=128, outlier_clip_threshold=3.0,
                            outlier_fraction=0.01, compensation_steps=comp_steps,
-                           asymmetric=False),  # Symmetric: stable, proven quality
+                           asymmetric=True),   # PT²-LLM ITF: closed-form, no clamping
             tokenizer=tokenizer,
             calibration_texts=_ensure_texts()[:32],
         )

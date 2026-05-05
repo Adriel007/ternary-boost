@@ -99,42 +99,37 @@ def build_optimal_grid(
     alpha_init: torch.Tensor = None,
     mu_init: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Closed-form optimal grid parameters (α*, μ*) given fixed T.
+    """Closed-form optimal grid (α*, μ*) given fixed T. PT²-LLM Eq. 9.
 
-    PT²-LLM Eq. 9. Includes numerical safeguards:
-      - Degenerate rows (all-zero T) keep their initialization
-      - α bounded to [0.1*α_init, 10*α_init]
-      - μ bounded to [μ_init - 3*α_init, μ_init + 3*α_init]
+    Degenerate rows (all-zero T or all-same-sign) have denom ≈ 0.
+    For these, keep the initialization values — the closed-form is undefined.
+    For all other rows, the raw closed-form is mathematically optimal;
+    no clamping needed.
     """
     m = w.shape[1]
     WoT = w * T
-    ToT = T * T
-
     sum_WoT = WoT.sum(dim=-1)
-    sum_ToT = ToT.sum(dim=-1)
+    sum_abs_T = T.abs().sum(dim=-1)       # |T| = T⊙T since T ∈ {-1,0,1}
     sum_T = T.sum(dim=-1)
     sum_W = w.sum(dim=-1)
 
-    denom = m * sum_ToT - sum_T * sum_T
-    safe = denom.abs() > 1e-6
+    denom = m * sum_abs_T - sum_T * sum_T
+    safe = denom > 1e-6                      # Cauchy-Schwarz: denom ≥ 0 always
 
-    alpha = torch.zeros_like(sum_W)
-    mu = torch.zeros_like(sum_W)
-
-    denom_safe = torch.where(safe, denom, torch.ones_like(denom))
-    alpha_raw = (m * sum_WoT - sum_T * sum_W) / denom_safe
-    mu_raw = (sum_ToT * sum_W - sum_T * sum_WoT) / denom_safe
+    # Raw closed-form (PT²-LLM Eq. 9)
+    denom_safe = denom.clamp_min(1e-6)
+    alpha_opt = (m * sum_WoT - sum_T * sum_W) / denom_safe
+    mu_opt = (sum_abs_T * sum_W - sum_T * sum_WoT) / denom_safe
 
     if alpha_init is not None and mu_init is not None:
         ai = alpha_init.squeeze(-1)
         mi = mu_init.squeeze(-1)
-        # Bound α: [0.1×init, 10×init]
-        alpha = torch.where(safe, alpha_raw.clamp(ai * 0.1, ai * 10), ai)
-        # Bound μ: [init - 3α, init + 3α]
-        mu = torch.where(safe, mu_raw.clamp(mi - 3 * alpha, mi + 3 * alpha), mi)
+        # Use init for degenerate rows; raw optimum for all others
+        alpha = torch.where(safe, alpha_opt, ai)
+        mu = torch.where(safe, mu_opt, mi)
     else:
-        alpha = torch.where(safe, alpha_raw, alpha_raw.abs().clamp_min(1e-6))
-        mu = torch.where(safe, mu_raw, torch.zeros_like(mu_raw))
+        alpha = torch.where(safe, alpha_opt, alpha_opt.abs().clamp_min(1e-6))
+        mu = torch.where(safe, mu_opt, torch.zeros_like(mu_opt))
 
     return alpha.unsqueeze(-1), mu.unsqueeze(-1)
 
@@ -324,6 +319,18 @@ def ternary_quantize_vectorized(
 
     # Merge outliers back
     reconstructed[outlier_mask] = w[outlier_mask]
+
+    # Safety: if reconstruction produced NaN/Inf, fall back to symmetric
+    if not torch.isfinite(reconstructed).all():
+        logger.warning(f"  ITF produced non-finite values — falling back to symmetric")
+        reconstructed = _symmetric_ternary(w_quant, config)
+        reconstructed[outlier_mask] = w[outlier_mask]
+
+    # Safety: if alpha/mu exploded (extreme values), fall back
+    if reconstructed.abs().max() > 1e6:
+        logger.warning(f"  ITF produced extreme values — falling back to symmetric")
+        reconstructed = _symmetric_ternary(w_quant, config)
+        reconstructed[outlier_mask] = w[outlier_mask]
 
     return reconstructed
 
