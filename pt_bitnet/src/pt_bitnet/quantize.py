@@ -303,32 +303,29 @@ def ternary_quantize_vectorized(
     w_clean = w.clone()
     w_clean[outlier_mask] = 0
 
-    if config.asymmetric:
+    if config.asymmetric and config.outlier_fraction == 0:
+        # ITF only: outliers destabilize the closed-form (zeroed positions
+        # shift row statistics), so only run ITF without outlier retention.
         alpha, mu, T = iterative_ternary_fitting(w_clean, config)
 
-        # --- AGA: refine grid with calibration inputs ---
         if calibration_inputs is not None:
             alpha, mu = activation_aware_grid_alignment(
                 w_clean, T, calibration_inputs, alpha, mu)
 
         reconstructed = alpha * T + mu
+
+        # Safety: ITF can still produce extreme values on degenerate rows
+        if not torch.isfinite(reconstructed).all():
+            logger.warning(f"  ITF produced non-finite values — falling back to symmetric")
+            reconstructed = _symmetric_ternary(w_clean, config)
+        elif reconstructed.abs().max() > 1e6:
+            logger.warning(f"  ITF produced extreme values — falling back to symmetric")
+            reconstructed = _symmetric_ternary(w_clean, config)
     else:
         reconstructed = _symmetric_ternary(w_clean, config)
 
     # Merge outliers back (kept in FP16)
     reconstructed[outlier_mask] = w[outlier_mask]
-
-    # Safety: if reconstruction produced NaN/Inf, fall back to symmetric
-    if not torch.isfinite(reconstructed).all():
-        logger.warning(f"  ITF produced non-finite values — falling back to symmetric")
-        reconstructed = _symmetric_ternary(w_clean, config)
-        reconstructed[outlier_mask] = w[outlier_mask]
-
-    # Safety: if alpha/mu exploded (extreme values), fall back
-    if reconstructed.abs().max() > 1e6:
-        logger.warning(f"  ITF produced extreme values — falling back to symmetric")
-        reconstructed = _symmetric_ternary(w_clean, config)
-        reconstructed[outlier_mask] = w[outlier_mask]
 
     return reconstructed
 
@@ -474,14 +471,15 @@ def _collect_activations(
     text = calibration_texts[0] if calibration_texts else "Hello world"
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=64)
     input_ids = inputs["input_ids"]
+    model_device = next(model.parameters()).device
     if has_cuda:
-        input_ids = input_ids.cuda()
+        input_ids = input_ids.to(model_device)
 
     with torch.no_grad():
         try:
             model(input_ids=input_ids)
-        except Exception:
-            pass  # Some layers might fail due to dtype issues
+        except Exception as e:
+            logger.warning(f"  Activation collection forward failed: {e}")
 
     for h in handles:
         h.remove()

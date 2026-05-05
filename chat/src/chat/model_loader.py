@@ -143,11 +143,19 @@ def _reconstruct_ultraquant(model: nn.Module, custom_params: dict, config) -> No
 
 
 def _bake_ultraquant_to_linear(model: nn.Module) -> None:
-    """Convert UltraQuantLinear layers to standard nn.Linear with baked weights.
+    """Convert UltraQuantLinear layers to standard nn.Linear.
 
-    Computes effective_weight = A + B * Lambada, then replaces UltraQuantLinear
-    with nn.Linear. All baked weights are cast to the model's dtype (from the
-    embedding layer) to avoid dtype mismatches during inference.
+    The Tequila forward pass is:
+        out = linear(input, A) + linear(ones, B * Lambada)
+
+    The second term adds a constant bias per output channel (same for all
+    tokens). To faithfully reproduce this in a standard nn.Linear:
+        weight = A           (ternary, preserves sparsity)
+        bias   = sum(B * Lambada, dim=-1)  (deadzone bias)
+
+    The old formula (A + B*L) was incorrect — it turned the deadzone
+    contribution into a full token-dependent matrix multiply, which
+    neither matches the Tequila forward nor preserves ternary sparsity.
     """
     from tequila.ultraquant import UltraQuantLinear, UltraQuantV3
     skip_modules = ("lm_head", "embed_tokens")
@@ -155,7 +163,6 @@ def _bake_ultraquant_to_linear(model: nn.Module) -> None:
                       "gate_proj", "up_proj", "down_proj")
     baked = 0
 
-    # Get model dtype from embedding layer (not quantized, preserves original dtype)
     embed_dtype = model.get_input_embeddings().weight.dtype
 
     for module_name, module in model.named_modules():
@@ -170,11 +177,15 @@ def _bake_ultraquant_to_linear(model: nn.Module) -> None:
             w = module.weight.data.float()
             A, B = UltraQuantV3.apply(w, module.granularity, module.group_size)
 
+            # Weight = ternary A only (deadzone bias handled below)
+            effective_weight = A.float()
+
             if hasattr(module, "Lambada"):
-                effective_weight = A.float() + B.float() * module.Lambada.data.float()
+                # linear(ones, B * Lambada) = sum(B * Lambada, dim=-1) per channel
+                deadzone_bias = (B.float() * module.Lambada.data.float()).sum(dim=-1)
             else:
-                effective_weight = A.float()
-            effective_weight = effective_weight.to(embed_dtype)
+                # v1/v2: linear(ones, B) → sum(B, dim=-1)
+                deadzone_bias = B.float().sum(dim=-1)
 
         parent_name = ".".join(module_name.split(".")[:-1])
         child_name = module_name.split(".")[-1]
@@ -183,11 +194,16 @@ def _bake_ultraquant_to_linear(model: nn.Module) -> None:
         device = module.weight.device
         new_linear = nn.Linear(
             module.in_features, module.out_features,
-            bias=module.bias is not None, dtype=embed_dtype, device=device,
+            bias=True, dtype=embed_dtype, device=device,
         )
         new_linear.weight.data.copy_(effective_weight.to(device))
+
+        # Combine original bias + deadzone contribution
         if module.bias is not None:
-            new_linear.bias.data.copy_(module.bias.data.to(device))
+            combined_bias = module.bias.data.float() + deadzone_bias
+        else:
+            combined_bias = deadzone_bias
+        new_linear.bias.data.copy_(combined_bias.to(device))
 
         setattr(parent, child_name, new_linear)
         baked += 1

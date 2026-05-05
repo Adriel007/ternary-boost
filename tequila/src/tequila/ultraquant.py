@@ -21,6 +21,7 @@ This preserves ternary efficiency while allowing deadzone weights to
 contribute a continuous signal and receive direct gradients.
 """
 
+import gc
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -327,7 +328,11 @@ def _replace_with_ultraquant(
     model: nn.Module,
     config: TequilaConfig,
 ) -> nn.Module:
-    """Replace target nn.Linear layers with UltraQuantLinear."""
+    """Replace target nn.Linear layers with UltraQuantLinear.
+
+    Creates new modules on the SAME device as the originals to avoid
+    temporary CPU↔GPU copies that exhaust system RAM on Colab T4.
+    """
     replacements = 0
     for module_name, module in model.named_modules():
         if any(skip in module_name for skip in config.skip_modules):
@@ -341,6 +346,7 @@ def _replace_with_ultraquant(
         child_name = module_name.split(".")[-1]
         parent = model if not parent_name else model.get_submodule(parent_name)
 
+        device = module.weight.device
         ultraquant = UltraQuantLinear(
             in_features=module.in_features,
             out_features=module.out_features,
@@ -352,7 +358,7 @@ def _replace_with_ultraquant(
             range_of_lambada=config.range_of_lambada,
             eps=config.eps,
             lambada_granularity=config.lambada_granularity,
-        )
+        ).to(device)
         ultraquant.weight.data.copy_(module.weight.data)
         if module.bias is not None:
             ultraquant.bias.data.copy_(module.bias.data)
@@ -387,6 +393,11 @@ def apply_tequila(
 
     logger.info(f"Applying Tequila deadzone trapping (method={config.quant_method})")
 
+    # Free memory from previous pipeline stages before creating new modules
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     model = _replace_with_ultraquant(model, config)
 
     if config.quant_method in ("ultraquantv3", "ultraquantv4"):
@@ -397,7 +408,8 @@ def apply_tequila(
                      f"(each with per-layer AdamW optimizer)")
 
         has_cuda = torch.cuda.is_available()
-        if has_cuda:
+        # Only move to CUDA if not already there (avoids double alloc)
+        if has_cuda and next(model.parameters()).device.type != "cuda":
             model.cuda()
 
         for epoch in range(config.num_epochs):
