@@ -419,6 +419,7 @@ def apply_tequila(
                 # only Lambada params have requires_grad=True.
                 # Each UltraQuantLinear.forward() calls update_lambada() which
                 # does its own zero_grad → backward → step internally.
+                # Residual connections are detached at each layer boundary.
                 model(input_ids=input_ids, attention_mask=attention_mask)
 
                 num_batches += 1
