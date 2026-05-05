@@ -180,13 +180,14 @@ def _bake_ultraquant_to_linear(model: nn.Module) -> None:
         child_name = module_name.split(".")[-1]
         parent = model if not parent_name else model.get_submodule(parent_name)
 
+        device = module.weight.device
         new_linear = nn.Linear(
             module.in_features, module.out_features,
-            bias=module.bias is not None, dtype=embed_dtype,
+            bias=module.bias is not None, dtype=embed_dtype, device=device,
         )
-        new_linear.weight.data.copy_(effective_weight)
+        new_linear.weight.data.copy_(effective_weight.to(device))
         if module.bias is not None:
-            new_linear.bias.data.copy_(module.bias.data.to(embed_dtype))
+            new_linear.bias.data.copy_(module.bias.data.to(device))
 
         setattr(parent, child_name, new_linear)
         baked += 1
