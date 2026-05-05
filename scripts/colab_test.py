@@ -15,9 +15,9 @@ REPO = "https://github.com/adriel007/ternary-boost.git"
 DIR = "ternary-boost"
 
 if not os.path.exists(DIR):
-    !git clone {REPO} 2>&1 | tail -1
+    os.system(f"git clone {REPO} 2>&1")
 os.chdir(DIR)
-!git pull 2>&1 | tail -1
+os.system("git pull 2>&1")
 
 for m in ["shared", "pt_bitnet", "tequila", "chat"]:
     sys.path.insert(0, os.path.join(m, "src"))
