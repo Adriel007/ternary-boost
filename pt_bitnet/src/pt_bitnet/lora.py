@@ -143,11 +143,12 @@ def finetune_lora(
 ) -> PreTrainedModel:
     """Fine-tune LoRA adapters on a ternary model with knowledge distillation.
 
-    The ternary backbone stays frozen. Only LoRA matrices (A, B) receive
-    gradients. A frozen FP16 teacher provides soft targets via KL divergence.
+    MEMORY-SAFE: Teacher logits are pre-computed and cached on CPU, then the
+    teacher is freed before fine-tuning starts. This avoids having both models
+    on GPU simultaneously, preventing OOM on T4 Colab.
 
-    Memory: model (ternary, frozen) + teacher (FP16, frozen) + LoRA params.
-    For Phi-2 on T4: ~11 GB + 0.4 GB = ~11.4 GB (fits 15.6 GB VRAM).
+    Peak VRAM: student (~6 GB) + LoRA (~0.1 GB) + optimizer (~0.2 GB)
+             + cached logits on CPU (~0.6 GB RAM) = ~6.5 GB VRAM, fits T4 easily.
     """
     if config is None:
         config = LoRAConfig()
@@ -159,34 +160,76 @@ def finetune_lora(
     model = _add_lora_to_model(model, config)
     model.train()
 
-    # Only LoRA params are trainable
     lora_params = _get_lora_params(model)
     total_lora = sum(p.numel() for p in lora_params)
     logger.info(f"  LoRA trainable params: {total_lora:,} "
                 f"({total_lora * 4 / 1e6:.1f} MB fp32)")
 
-    # ── Optimizer & scheduler ────────────────────────────────────
+    # ── Phase 1: Pre-compute teacher logits ──────────────────────
+    teacher_logits_cache = []
+    if teacher_model is not None:
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
+
+        # Move student to CPU to free VRAM for teacher
+        student_device = device
+        if has_cuda:
+            # Save student to CPU temporarily
+            for p in model.parameters():
+                p.data = p.data.cpu()
+            torch.cuda.empty_cache()
+            logger.info("  Temporarily moved student to CPU for teacher pass")
+
+        logger.info("  Pre-computing teacher logits (one forward pass)...")
+        for i, text in enumerate(calibration_texts):
+            inputs = tokenizer(text, return_tensors="pt", truncation=True,
+                               max_length=config.max_seq_length)
+            input_ids = inputs["input_ids"]
+            if has_cuda:
+                input_ids = input_ids.cuda()
+
+            with torch.no_grad():
+                out = teacher_model(input_ids=input_ids)
+            # Keep logits on CPU to save GPU memory
+            teacher_logits_cache.append(out.logits.detach().cpu())
+            del out
+
+            cache_mb = sum(t.numel() * 2 for t in teacher_logits_cache) / 1e6
+            if (i + 1) % max(1, len(calibration_texts) // 5) == 0:
+                logger.info(f"    Cached {i + 1}/{len(calibration_texts)} "
+                            f"teacher logits ({cache_mb:.0f} MB CPU RAM)")
+
+        # Free teacher
+        del teacher_model
+        gc.collect()
+        if has_cuda:
+            torch.cuda.empty_cache()
+
+        # Move student back to GPU
+        if has_cuda:
+            model.to(device)
+            logger.info("  Student back on GPU, teacher freed")
+            _log_vram("  VRAM after teacher cleanup")
+
+        logger.info(f"  Cached {len(teacher_logits_cache)} teacher logits "
+                    f"({cache_mb:.0f} MB CPU RAM)")
+    else:
+        logger.info("  No teacher — using CE loss only (no distillation)")
+
+    # ── Phase 2: Fine-tune LoRA ─────────────────────────────────
     optimizer = torch.optim.AdamW(lora_params, lr=config.learning_rate,
                                   weight_decay=0.01, betas=(0.9, 0.999))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.num_steps, eta_min=config.learning_rate * 0.1,
+        optimizer, T_max=config.num_steps,
+        eta_min=config.learning_rate * 0.1,
     )
 
-    # ── Teacher setup ────────────────────────────────────────────
-    teacher = teacher_model
-    if teacher is not None:
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad = False
-        logger.info("  Teacher (FP16): frozen for knowledge distillation")
-
-    # ── Fine-tuning loop ─────────────────────────────────────────
     total_loss_ema = 0.0
     best_loss = float("inf")
     optimizer.zero_grad()
 
     for step in range(config.num_steps):
-        # Cycle through calibration texts
         text_idx = step % len(calibration_texts)
         text = calibration_texts[text_idx]
 
@@ -196,37 +239,40 @@ def finetune_lora(
         if input_ids.numel() < 2:
             continue
 
-        # ── Forward ──────────────────────────────────────────
-        # Student forward (ternary + LoRA)
+        # Student forward (ternary + LoRA) — only model on GPU
         student_out = model(input_ids=input_ids, labels=input_ids)
         ce_loss = student_out.loss
 
-        # Teacher forward (FP16, no grad)
+        # KD using pre-cached teacher logits (on CPU)
         distill_loss = torch.tensor(0.0, device=device)
-        if teacher is not None:
-            with torch.no_grad():
-                teacher_out = teacher(input_ids=input_ids)
-            # KL divergence on logits
+        if teacher_logits_cache:
+            cached_logits = teacher_logits_cache[text_idx].to(device)
+            # Align sequence lengths (cached might be longer than student)
+            min_len = min(student_out.logits.shape[1], cached_logits.shape[1])
             T = config.temperature
-            student_log_probs = F.log_softmax(student_out.logits / T, dim=-1)
-            teacher_probs = F.softmax(teacher_out.logits / T, dim=-1)
+            student_log_probs = F.log_softmax(
+                student_out.logits[:, :min_len, :] / T, dim=-1)
+            teacher_probs = F.softmax(
+                cached_logits[:, :min_len, :] / T, dim=-1)
             distill_loss = F.kl_div(student_log_probs, teacher_probs,
                                     reduction="batchmean") * (T * T)
+            del cached_logits  # Free GPU copy
 
         # Combined loss
-        beta = config.distill_weight if teacher is not None else 0.0
+        beta = config.distill_weight if teacher_logits_cache else 0.0
         loss = (1.0 - beta) * ce_loss + beta * distill_loss
         loss = loss / config.gradient_accumulation
         loss.backward()
+        del student_out
 
-        # ── Optimization step ────────────────────────────────
+        # Optimization step (accumulated over gradient_accumulation batches)
         if (step + 1) % config.gradient_accumulation == 0:
             torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-        # ── Logging ──────────────────────────────────────────
+        # Logging
         total_loss_ema = 0.95 * total_loss_ema + 0.05 * loss.item()
         if step == 0 or (step + 1) % max(1, config.num_steps // 10) == 0:
             lr = scheduler.get_last_lr()[0]
@@ -236,22 +282,25 @@ def finetune_lora(
                 f"kd={distill_loss.item():.4f} lr={lr:.2e}"
             )
 
-        # Track best
         if loss.item() < best_loss:
             best_loss = loss.item()
 
     # ── Finalize ─────────────────────────────────────────────────
     model.eval()
     logger.info(f"  LoRA fine-tuning complete. Best loss: {best_loss:.4f}")
-
-    # Clean up teacher to free VRAM
-    if teacher is not None:
-        del teacher
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
     return model
+
+
+def _log_vram(label: str = "") -> None:
+    """Log current VRAM usage for debugging memory issues."""
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info(
+            f"{label}: VRAM {alloc:.1f}/{total:.1f} GB used "
+            f"({reserved:.1f} GB reserved)"
+        )
 
 
 def merge_lora_to_weights(model: nn.Module) -> nn.Module:

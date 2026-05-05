@@ -26,10 +26,11 @@ os.environ.setdefault("HF_HOME", "/content/cache/huggingface")
 MODEL = "microsoft/phi-2"
 
 # LoRA fine-tuning (quality recovery after ternary quantization)
-# rank=32: good balance of quality/speed. Higher = better but slower.
+# Memory-safe: teacher logits pre-computed on CPU, student trained alone.
+# Peak VRAM: ~6 GB (Phi-2). Fits T4 easily.
 ENABLE_LORA = True
-LORA_RANK = 32
-LORA_STEPS = 500       # Reduce to 200 for quick test, 500+ for best quality
+LORA_RANK = 32          # 16-64. Higher = better quality but more VRAM
+LORA_STEPS = 500        # 200 fast test, 500+ best quality
 # ═══════════════════════════════════════════════════════════════════════
 
 # ── Setup ──────────────────────────────────────────────────────────

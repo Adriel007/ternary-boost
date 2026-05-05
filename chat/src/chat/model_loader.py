@@ -523,51 +523,51 @@ def _compress_and_cache(
         logger.info(f"Stage 4/4: LoRA fine-tuning (rank={lora_rank}, quality recovery)")
         t0 = time.time()
 
-        # Check if teacher + student fit in VRAM
+        # Check VRAM: teacher and student alternate on GPU (not simultaneous)
+        # Peak: teacher alone (~6 GB for Phi-2) or student+LoRA (~6 GB)
         if has_cuda:
-            vram_free = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
-            est_teacher = sum(p.numel() for p in model.parameters()) * 2  # bf16 bytes
-            if vram_free < est_teacher * 1.5:
-                logger.warning(f"  Insufficient VRAM for teacher + student "
-                               f"(free={vram_free/1e9:.1f} GB, need ~{est_teacher*2.5/1e9:.1f} GB)")
-                logger.warning(f"  Skipping LoRA — use a larger GPU or set lora_rank=0")
-                _mark_stage_done(cache_dir, 4, 0)
-            else:
-                from pt_bitnet.lora import finetune_lora, LoRAConfig
+            vram_total = torch.cuda.get_device_properties(0).total_memory / 1e9
+            est_model = sum(p.numel() for p in model.parameters()) * 2 / 1e9  # bf16
+            if vram_total < est_model * 1.8:  # Need ~1.8x model size for safe operation
+                logger.warning(f"  VRAM tight for LoRA (GPU={vram_total:.1f} GB, "
+                               f"model={est_model:.1f} GB). Attempting anyway...")
 
-                logger.info("  Loading FP16 teacher for distillation...")
-                from transformers import AutoConfig
-                teacher_config = AutoConfig.from_pretrained(
-                    entry.path, trust_remote_code=True, cache_dir=str(hf_cache),
-                )
-                if not hasattr(teacher_config, "pad_token_id") or teacher_config.pad_token_id is None:
-                    teacher_config.pad_token_id = 0
-                teacher = AutoModelForCausalLM.from_pretrained(
-                    entry.path, torch_dtype=dtype, low_cpu_mem_usage=True,
-                    device_map="cpu", trust_remote_code=True, cache_dir=str(hf_cache),
-                    config=teacher_config,
-                )
-                if has_cuda:
-                    teacher.cuda()
+            from pt_bitnet.lora import finetune_lora, LoRAConfig
 
-                texts_data = _ensure_texts()
-                lo_cfg = LoRAConfig(
-                    rank=lora_rank,
-                    num_steps=getattr(entry, "lora_steps", 500),
-                    distill_weight=0.5,
-                )
-                model = finetune_lora(model, tokenizer, texts_data[:50], teacher, lo_cfg)
+            logger.info("  Loading FP16 teacher for logit pre-computation...")
+            from transformers import AutoConfig
+            teacher_config = AutoConfig.from_pretrained(
+                entry.path, trust_remote_code=True, cache_dir=str(hf_cache),
+            )
+            if not hasattr(teacher_config, "pad_token_id") or teacher_config.pad_token_id is None:
+                teacher_config.pad_token_id = 0
+            teacher = AutoModelForCausalLM.from_pretrained(
+                entry.path, torch_dtype=dtype, low_cpu_mem_usage=True,
+                device_map="cpu", trust_remote_code=True, cache_dir=str(hf_cache),
+                config=teacher_config,
+            )
+            if has_cuda:
+                teacher.cuda()
 
-                del teacher; gc.collect()
-                if has_cuda:
-                    torch.cuda.empty_cache()
+            texts_data = _ensure_texts()
+            lo_cfg = LoRAConfig(
+                rank=lora_rank,
+                num_steps=getattr(entry, "lora_steps", 500),
+                distill_weight=0.5,
+                max_seq_length=64,  # Shorter seq = less VRAM for activations
+                batch_size=1,       # Batch 1 = safer memory
+                gradient_accumulation=8,  # More accumulation = same effective batch
+            )
+            # finetune_lora: pre-computes teacher logits → frees teacher →
+            # fine-tunes with student only. Peak VRAM: one model at a time.
+            model = finetune_lora(model, tokenizer, texts_data[:50], teacher, lo_cfg)
 
-                from pt_bitnet.lora import save_lora_weights
-                save_lora_weights(model, str(cache_dir / "lora_weights.safetensors"))
+            from pt_bitnet.lora import save_lora_weights
+            save_lora_weights(model, str(cache_dir / "lora_weights.safetensors"))
 
-                elapsed = time.time() - t0
-                logger.info(f"LoRA fine-tuning complete in {elapsed:.1f}s")
-                _mark_stage_done(cache_dir, 4, elapsed)
+            elapsed = time.time() - t0
+            logger.info(f"LoRA fine-tuning complete in {elapsed:.1f}s")
+            _mark_stage_done(cache_dir, 4, elapsed)
         else:
             logger.info("  LoRA requires GPU — skipping on CPU")
             _mark_stage_done(cache_dir, 4, 0)
