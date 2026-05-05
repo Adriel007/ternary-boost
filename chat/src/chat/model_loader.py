@@ -534,20 +534,19 @@ def _compress_and_cache(
 
             from pt_bitnet.lora import finetune_lora, LoRAConfig
 
-            logger.info("  Loading FP16 teacher for logit pre-computation...")
+            logger.info("  Loading FP16 teacher on CPU for logit pre-computation...")
             from transformers import AutoConfig
             teacher_config = AutoConfig.from_pretrained(
                 entry.path, trust_remote_code=True, cache_dir=str(hf_cache),
             )
             if not hasattr(teacher_config, "pad_token_id") or teacher_config.pad_token_id is None:
                 teacher_config.pad_token_id = 0
+            # Teacher stays on CPU — avoids GPU OOM. CPU forward is ~0.5s per text.
             teacher = AutoModelForCausalLM.from_pretrained(
                 entry.path, torch_dtype=dtype, low_cpu_mem_usage=True,
                 device_map="cpu", trust_remote_code=True, cache_dir=str(hf_cache),
                 config=teacher_config,
             )
-            if has_cuda:
-                teacher.cuda()
 
             texts_data = _ensure_texts()
             lo_cfg = LoRAConfig(

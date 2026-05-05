@@ -57,6 +57,9 @@ class LoRALinear(nn.Module):
 
     Where A is [rank, in_features] and B is [out_features, rank].
     Only A and B receive gradients; W_ternary stays frozen.
+
+    LoRA params are float32 for AdamW stability. During forward, they are
+    cast to the input dtype (bfloat16) to avoid dtype mismatch.
     """
 
     def __init__(self, base: nn.Linear, config: LoRAConfig):
@@ -70,21 +73,26 @@ class LoRALinear(nn.Module):
         in_f = base.in_features
         out_f = base.out_features
 
-        # A: maps input to low-rank space [rank, in_f]
-        self.lora_A = nn.Parameter(torch.randn(config.rank, in_f) * 0.02)
-        # B: maps low-rank back to output [out_f, rank]
-        self.lora_B = nn.Parameter(torch.zeros(out_f, config.rank))
+        # float32 for training stability (AdamW accumulates small updates)
+        self.lora_A = nn.Parameter(
+            torch.randn(config.rank, in_f, device=base.weight.device) * 0.02
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(out_f, config.rank, device=base.weight.device)
+        )
 
         # Freeze base
         for p in self.base.parameters():
             p.requires_grad = False
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        # Ternary base forward (frozen) — pass kwargs for attention_mask etc.
-        base_out = self.base(x) if not kwargs else self.base(x, **kwargs)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ternary base forward (frozen) — nn.Linear takes only x
+        base_out = self.base(x)
 
-        # LoRA forward: x @ A.T @ B.T
-        lora_out = self.scaling * (self.dropout(x) @ self.lora_A.T @ self.lora_B.T)
+        # LoRA forward: cast params to input dtype for matmul compatibility
+        A = self.lora_A.to(dtype=x.dtype)
+        B = self.lora_B.to(dtype=x.dtype)
+        lora_out = self.scaling * (self.dropout(x) @ A.T @ B.T)
 
         return base_out + lora_out
 
@@ -165,34 +173,27 @@ def finetune_lora(
     logger.info(f"  LoRA trainable params: {total_lora:,} "
                 f"({total_lora * 4 / 1e6:.1f} MB fp32)")
 
-    # ── Phase 1: Pre-compute teacher logits ──────────────────────
+    # ── Phase 1: Pre-compute teacher logits on CPU ───────────────
+    # Teacher stays on CPU the entire time. Student stays on GPU.
+    # No model transfers = no memory leaks. CPU forward is ~0.5s/text.
     teacher_logits_cache = []
     if teacher_model is not None:
         teacher_model.eval()
         for p in teacher_model.parameters():
             p.requires_grad = False
-
-        # Move student to CPU to free VRAM for teacher
-        student_device = device
+        # Teacher stays on CPU — no GPU memory impact
+        teacher_model.cpu()
         if has_cuda:
-            # Save student to CPU temporarily
-            for p in model.parameters():
-                p.data = p.data.cpu()
             torch.cuda.empty_cache()
-            logger.info("  Temporarily moved student to CPU for teacher pass")
 
-        logger.info("  Pre-computing teacher logits (one forward pass)...")
+        logger.info("  Pre-computing teacher logits on CPU (~0.5s per text)...")
         for i, text in enumerate(calibration_texts):
             inputs = tokenizer(text, return_tensors="pt", truncation=True,
                                max_length=config.max_seq_length)
-            input_ids = inputs["input_ids"]
-            if has_cuda:
-                input_ids = input_ids.cuda()
-
+            # Teacher forward on CPU
             with torch.no_grad():
-                out = teacher_model(input_ids=input_ids)
-            # Keep logits on CPU to save GPU memory
-            teacher_logits_cache.append(out.logits.detach().cpu())
+                out = teacher_model(input_ids=inputs["input_ids"])
+            teacher_logits_cache.append(out.logits.detach())  # stays on CPU
             del out
 
             cache_mb = sum(t.numel() * 2 for t in teacher_logits_cache) / 1e6
@@ -200,16 +201,11 @@ def finetune_lora(
                 logger.info(f"    Cached {i + 1}/{len(calibration_texts)} "
                             f"teacher logits ({cache_mb:.0f} MB CPU RAM)")
 
-        # Free teacher
+        # Free teacher (was on CPU, no GPU impact)
         del teacher_model
         gc.collect()
         if has_cuda:
             torch.cuda.empty_cache()
-
-        # Move student back to GPU
-        if has_cuda:
-            model.to(device)
-            logger.info("  Student back on GPU, teacher freed")
             _log_vram("  VRAM after teacher cleanup")
 
         logger.info(f"  Cached {len(teacher_logits_cache)} teacher logits "
