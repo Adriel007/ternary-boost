@@ -93,6 +93,68 @@ Replace subprocess call with `ctypes`/`cffi` bindings for:
 - Direct memory access
 - Batch inference
 
+## AirLLM Integration (Research)
+
+### What is AirLLM?
+[lyogavin/AirLLM](https://github.com/lyogavin/airllm) — Apache 2.0, 7k+ stars. Layer-by-layer
+model loading: loads one transformer layer at a time from disk, processes it, frees memory.
+Achieves 70B inference on 4GB GPU, 405B on 8GB. CPU-only mode since v2.10.1. Built-in
+4bit/8bit compression via bitsandbytes with profiling tools.
+
+### How it helps ternary-boost
+
+**PT-BitNet stage** — Already processes layers one at a time, BUT requires loading the
+full model first (~11 GB for 2.7B, ~28 GB for 7B float32). AirLLM-style loading would
+eliminate this peak: load layer k → quantize → save → free → load layer k+1. Memory peak
+drops from full model size to single layer (~50 MB for 7B). This enables 7B-70B pipeline
+on consumer hardware.
+
+**Compensation stage** — AirLLM's layer-by-layer forward pass could enable lm_head
+compensation on low-RAM hardware. Forward hook captures last hidden state → lm_head update.
+Transformer body loaded/unloaded layer-by-layer during forward. Not yet compatible with
+our gradient-based compensation (needs backward pass on lm_head).
+
+**Tequila stage** — Similar: forward passes with per-layer loading. Tequila's per-layer
+`update_lambada()` does its own backward internally. Could work if forward is adapted to
+AirLLM-style streaming.
+
+**User's hardware (15 GB RAM, 12-core CPU):** With AirLLM integration, could run pipeline
+on 7B-14B models. Currently limited to 2.7B due to peak RAM.
+
+### Caveats & Limitations
+
+| Factor | Impact |
+|--------|--------|
+| Disk I/O overhead | ~2-3× slower than in-memory (reads layers from disk each forward pass) |
+| Gradient compatibility | AirLLM designed for inference, not training. Compensation backward needs adaptation |
+| Custom layer types | AirLLM uses standard HF layers. Our QuantizeLinear/UltraQuantLinear not natively supported |
+| bitsandbytes dep | Only needed if using AirLLM's built-in compression (we have our own) |
+| Model splitting pre-processing | AirLLM requires pre-splitting model into per-layer files. One-time cost |
+
+### Implementation Plan (if pursued)
+
+1. **PT-BitNet integration** (lowest effort, highest impact):
+   - Use AirLLM for initial model loading: `AirLLM.from_pretrained(model, layer_by_layer=True)`
+   - Iterate: for each layer, load weight tensor, run ternary_quantize_vectorized, save
+   - Replace our `_find_quantizable_linears` + `apply_pt_bitnet` loop
+   - Peak RAM: ~50 MB per layer instead of full model
+
+2. **Compensation adaptation** (medium effort):
+   - Implement AirLLM-style forward pass: for each batch, load layers 0..N sequentially
+   - Capture last hidden state via hook on final layer
+   - Run lm_head backward normally (lm_head is small, <1 GB)
+   - Rest of transformer uses no_grad + sequential loading
+
+3. **Full pipeline AirLLM mode** (high effort):
+   - `tchat --model llama-7b --airllm` flag
+   - Entire pipeline uses sequential layer loading
+   - Tequila adapted to process layers one at a time
+
+### Decision
+Not implemented yet. The immediate priority is making the ITF produce good quality on
+2.7B models. Once that's validated, AirLLM integration would unlock 7B+ models on the
+user's hardware. Added to backlog for post-stability phase.
+
 ## Done
 - [x] Per-channel Lambada (6 MB vs 2.5 GB per-element)
 - [x] Sharded safetensors save (800 MB chunks, Colab-safe)
