@@ -10,6 +10,9 @@ Or just copy-paste the entire script into a Colab cell and run.
 """
 import sys, os, time, json
 
+# Use our cache to avoid re-downloading the model for baseline comparison
+os.environ.setdefault("HF_HOME", "/content/cache/huggingface")
+
 # ── Setup ──────────────────────────────────────────────────────────
 # Script expects to be run from INSIDE the ternary-boost directory.
 # The user should have cloned and cd'd before running this.
@@ -80,9 +83,10 @@ for category, prompt in tests:
     gen_tokens = out.shape[1] - inputs.input_ids.shape[1]
     response = tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
 
-    quality = "GOOD" if len(response.split()) > 2 and not any(
-        w in response.lower() for w in ["quota", "wasserman", "parcel", "dur"]
-    ) else "BAD"
+    # Honest quality check: does response contain relevant keywords?
+    is_coherent = len(response.split()) > 2
+    is_relevant = any(w in response.lower() for w in ["paris", "france", "learn", "data", "algorithm", "moon", "night", "sky", "mile", "120", "distance", "speed"])
+    quality = "OK" if (is_coherent and is_relevant) else "POOR"
 
     print(f"  Response: '{response.strip()[:200]}'")
     print(f"  Tokens: {gen_tokens} | Time: {gen_time:.1f}s | Speed: {gen_tokens/gen_time:.2f} tok/s | Quality: {quality}")
@@ -101,9 +105,9 @@ torch.cuda.empty_cache()
 
 base = AutoModelForCausalLM.from_pretrained(
     MODEL, torch_dtype=dtype, low_cpu_mem_usage=True,
-    device_map=device, trust_remote_code=True, local_files_only=True,
+    device_map=device, trust_remote_code=True,
 )
-base_tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True, local_files_only=True)
+base_tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
 base_tok.pad_token = base_tok.eos_token
 
 results["baseline_tests"] = []
@@ -118,7 +122,9 @@ for category, prompt in tests:
     gen_tokens = out.shape[1] - inputs.input_ids.shape[1]
     response = base_tok.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
 
-    quality = "GOOD" if len(response.split()) > 2 else "BAD"
+    is_coherent = len(response.split()) > 2
+    is_relevant = any(w in response.lower() for w in ["paris", "france", "learn", "data", "algorithm", "moon", "night", "sky", "mile", "120", "distance", "speed"])
+    quality = "OK" if (is_coherent and is_relevant) else "POOR"
     print(f"[{category}] '{response.strip()[:150]}' ({gen_tokens} tok, {gen_time:.1f}s)")
 
     results["baseline_tests"].append({
