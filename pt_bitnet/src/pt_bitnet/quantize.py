@@ -279,14 +279,21 @@ def ternary_quantize_vectorized(
     """Full PT²-LLM quantization pipeline: ITF + AGA + Outlier Retention.
 
     1. Identify and preserve outliers (SpQR-style)
-    2. Run ITF on non-outlier weights → converged (α, μ, T)
-    3. Run AGA with calibration inputs → refined (α, μ)
-    4. Merge: outliers kept FP16, rest quantized to {-α+μ, μ, +α+μ}
+    2. Compute activation-aware column weights from calibration data
+    3. Run ITF on non-outlier weights or symmetric ternary
+    4. Merge: outliers kept FP16, rest quantized
     """
     w = weight.float()
     out_f, in_f = w.shape
 
-    # --- Outlier identification (SpQR-style) — MUST run BEFORE ITF ---
+    # --- Activation-aware column weights ---
+    col_weights = None
+    if calibration_inputs is not None:
+        # Hessian diagonal: mean activation squared per input channel
+        col_weights = (calibration_inputs.float() ** 2).mean(dim=0)  # [in_f]
+        col_weights = col_weights / col_weights.mean().clamp_min(1e-8)  # normalize
+
+    # --- Outlier identification (SpQR-style) ---
     if config.outlier_fraction > 0:
         w_abs = w.abs()
         row_mean = w_abs.mean(dim=-1, keepdim=True)
@@ -299,13 +306,11 @@ def ternary_quantize_vectorized(
     else:
         outlier_mask = torch.zeros_like(w, dtype=torch.bool)
 
-    # Remove outliers before quantization (they destabilize ITF closed-form)
+    # Remove outliers before quantization
     w_clean = w.clone()
     w_clean[outlier_mask] = 0
 
     if config.asymmetric and config.outlier_fraction == 0:
-        # ITF only: outliers destabilize the closed-form (zeroed positions
-        # shift row statistics), so only run ITF without outlier retention.
         alpha, mu, T = iterative_ternary_fitting(w_clean, config)
 
         if calibration_inputs is not None:
@@ -314,15 +319,14 @@ def ternary_quantize_vectorized(
 
         reconstructed = alpha * T + mu
 
-        # Safety: ITF can still produce extreme values on degenerate rows
         if not torch.isfinite(reconstructed).all():
             logger.warning(f"  ITF produced non-finite values — falling back to symmetric")
-            reconstructed = _symmetric_ternary(w_clean, config)
+            reconstructed = _symmetric_ternary(w_clean, config, col_weights)
         elif reconstructed.abs().max() > 1e6:
             logger.warning(f"  ITF produced extreme values — falling back to symmetric")
-            reconstructed = _symmetric_ternary(w_clean, config)
+            reconstructed = _symmetric_ternary(w_clean, config, col_weights)
     else:
-        reconstructed = _symmetric_ternary(w_clean, config)
+        reconstructed = _symmetric_ternary(w_clean, config, col_weights)
 
     # Merge outliers back (kept in FP16)
     reconstructed[outlier_mask] = w[outlier_mask]
@@ -332,11 +336,22 @@ def ternary_quantize_vectorized(
 
 def _symmetric_ternary(
     w: torch.Tensor, config: PTBitNetConfig,
+    col_weights: torch.Tensor = None,
 ) -> torch.Tensor:
-    """Symmetric ternary fallback: {-α, 0, +α}."""
+    """Symmetric ternary fallback: {-α, 0, +α}.
+
+    If col_weights is provided (e.g., Hessian diagonal), the error
+    computation weights each column by its activation importance:
+      error = Σ_j h_j * (w_ij - w_q_ij)^2
+    This is the activation-aware variant — channels with higher activations
+    get finer quantization.
+    """
     out_f, in_f = w.shape
     w_abs = w.abs()
     w_sign = w.sign()
+
+    if col_weights is None:
+        col_weights = torch.ones(in_f, device=w.device)
 
     w_abs_sorted, _ = w_abs.sort(dim=-1)
     n_candidates = min(in_f, 256)
@@ -346,6 +361,7 @@ def _symmetric_ternary(
 
     best_error = torch.full((out_f,), float("inf"), device=w.device)
     best_result = torch.zeros_like(w)
+    cw = col_weights.unsqueeze(0)  # [1, in_f] for broadcasting
 
     for j in range(candidate_indices.size(0)):
         delta = candidate_deltas[:, j:j+1]
@@ -353,7 +369,9 @@ def _symmetric_ternary(
         active_count = active.sum(dim=-1).clamp_min(1)
         alpha = (w_abs * active.float()).sum(dim=-1) / active_count
         recon = torch.where(active, alpha.unsqueeze(-1) * w_sign, torch.zeros_like(w))
-        error = ((w - recon) ** 2).sum(dim=-1)
+        # Weighted error: columns with higher activations contribute more
+        sq_error = ((w - recon) ** 2) * cw
+        error = sq_error.sum(dim=-1)
         improve = error < best_error
         best_error = torch.where(improve, error, best_error)
         best_result = torch.where(improve.unsqueeze(-1), recon, best_result)
@@ -399,22 +417,41 @@ def apply_pt_bitnet(
             # Move to GPU for speed if available
             w_clean = w.cuda() if torch.cuda.is_available() else w
 
-            # Get calibration inputs for this layer (for AGA)
+            # Get calibration inputs for this layer (for AGA / OBC compensation)
             calib_in = calibration_acts.get(name) if calibration_acts else None
             if calib_in is not None and torch.cuda.is_available():
                 calib_in = calib_in.cuda()
 
-                    # Normalize before quantization
+            # Normalize before quantization
             w_mean = w_clean.mean(dim=-1, keepdim=True)
             w_std = w_clean.std(dim=-1, keepdim=True).clamp_min(1e-8)
             w_norm = (w_clean - w_mean) / w_std
             w_norm = w_norm.clamp(-config.outlier_clip_threshold, config.outlier_clip_threshold)
 
-            # PT²-LLM quantization (no SSR — SSR needs debugging, see TODO)
-            ternary_w = ternary_quantize_vectorized(w_norm, config, calib_in)
+            # PT²-LLM quantization
+            ternary_w_norm = ternary_quantize_vectorized(w_norm, config, calib_in)
 
             # Denormalize
-            ternary_w = ternary_w * w_std + w_mean
+            ternary_w = ternary_w_norm * w_std + w_mean
+
+            # ── OBC-style row compensation ──────────────────────
+            # Activation-aware bias correction in output space.
+            # After ternary quantization, each row has residual error.
+            # We project this error through the mean calibration activation
+            # to get the optimal per-output-channel bias correction.
+            # Closed-form, no training. First-order OBC approximation.
+            if calib_in is not None:
+                x_mean = calib_in.float().mean(dim=0)  # [in_f]
+                # Error in output space: ternary_w - original_w
+                error = ternary_w.float() - w.float()   # [out_f, in_f]
+                bias_comp = -(error @ x_mean)            # [out_f]
+                if module.bias is not None:
+                    module.bias.data.add_(
+                        bias_comp.to(device=device, dtype=module.bias.dtype))
+                else:
+                    module.bias = nn.Parameter(
+                        bias_comp.to(device=device, dtype=module.weight.dtype))
+
             ternary_w = ternary_w.to(device=device, dtype=module.weight.dtype)
 
             module.weight = nn.Parameter(ternary_w)
@@ -424,7 +461,8 @@ def apply_pt_bitnet(
                 logger.info(f"  PT-BitNet: {i + 1}/{len(targets)} layers "
                             f"({100 * (i + 1) // len(targets)}%)")
 
-    logger.info(f"PT-BitNet complete: {len(targets)} layers quantized")
+    logger.info(f"PT-BitNet complete: {len(targets)} layers quantized "
+                f"(with activation-aware row compensation)")
 
     # Optional: Hessian compensation on lm_head
     if config.compensation_steps > 0 and tokenizer is not None and calibration_texts is not None:
