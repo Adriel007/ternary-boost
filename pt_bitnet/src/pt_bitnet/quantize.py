@@ -437,15 +437,11 @@ def apply_pt_bitnet(
 
             # ── OBC-style row compensation ──────────────────────
             # Activation-aware bias correction in output space.
-            # After ternary quantization, each row has residual error.
-            # We project this error through the mean calibration activation
-            # to get the optimal per-output-channel bias correction.
-            # Closed-form, no training. First-order OBC approximation.
             if calib_in is not None:
-                x_mean = calib_in.float().mean(dim=0)  # [in_f]
-                # Error in output space: ternary_w - original_w
-                error = ternary_w.float() - w.float()   # [out_f, in_f]
-                bias_comp = -(error @ x_mean)            # [out_f]
+                x_mean = calib_in.float().reshape(-1, calib_in.shape[-1]).mean(dim=0)
+                # Error in output space: use w_clean (GPU) not w (may be CPU)
+                error = ternary_w.float() - w_clean.float()  # [out_f, in_f]
+                bias_comp = -(error @ x_mean)                 # [out_f]
                 if module.bias is not None:
                     module.bias.data.add_(
                         bias_comp.to(device=device, dtype=module.bias.dtype))
