@@ -172,18 +172,21 @@ python run_pipeline.py \
 
 ### Phi-2 (2.7B) — Colab T4 (15.6 GB VRAM)
 
-| Metric | Baseline FP16 | Quantized (ternary) | Ratio |
-|--------|--------------|---------------------|-------|
-| **Perplexity** (diverse texts) | 2.61 | 3.45 | 1.32x |
-| **Generation quality** (avg 0-100) | 94 | 94 | 1.00x |
-| **Repetition ratio** | 0.00 | 0.00 | — |
-| **Inference speed** | — | 20.5 tok/s | — |
-| **Pipeline time** | — | 10.1 min | — |
-| **Disk** | 5.6 GB | 5.6 GB | — |
+| Metric | Baseline FP16 | PT-BitNet Only | + LoRA v3 (best) |
+|--------|--------------|----------------|-------------------|
+| **Perplexity** (diverse texts) | 3.16 | — | 3.91 |
+| **PPL ratio** (quant/baseline) | 1.00x | 1.32x* | **1.24x** |
+| **Generation quality** (avg 0-100) | 82 | 94* | 88 |
+| **Repetition ratio** | 0.00 | 0.00* | 0.00 |
+| **Inference speed** | — | 20.5 tok/s | 19.2 tok/s |
+| **Pipeline time** | — | 10.1 min | 34.7 min |
+| **Disk** | 5.6 GB | 5.6 GB | 5.6 GB |
 
-**Verdict: GOOD** — minor perplexity loss (32%), identical generation quality, no degeneration. Post-training ternary on small models (2.7B) is inherently harder due to less parameter redundancy. PT²-LLM reports 1.15-1.25x PPL ratios on 7-70B models.
+*PT-BitNet only metrics use simple texts (baseline 2.61). LoRA v3 uses diverse texts (baseline 3.16).
 
-**With LoRA (rank=32, 500 steps):** Pending Colab run. Expected PPL ratio improvement from 1.32x → 1.05-1.15x based on QLoRA literature (LoRA on quantized weights recovers quality proportional to rank). LoRA adds ~0.5% trainable parameters and ~10 min to pipeline time.
+**Verdict: GOOD** — PPL ratio 1.24x, generation quality matches or exceeds baseline. All factual answers correct. LoRA adds ~25 min for ~7% PPL improvement.
+
+**Latest experiment (2026-05-06):** OBC row compensation + activation-aware thresholds were tested but regressed PPL to 1.28x — the simpler PT-BitNet + LoRA configuration remains the best.
 
 Full results and sample outputs: [`results/phi2_ternary.md`](results/phi2_ternary.md)
 

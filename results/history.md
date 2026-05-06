@@ -19,6 +19,8 @@ Failures are as important as successes — they show what doesn't work and why.
 2026-05-05  11:00   Tequila removed from pipeline. PPL 3.45 (GOOD).
 2026-05-05  17:00   LoRA v1 implemented. PPL 3.96 (WORSE than no LoRA).
 2026-05-05  19:00   LoRA v2: hyperparameter fixes + re-quantization. Pending test.
+2026-05-06  12:00   LoRA v3 (dense merge): PPL 1.239x — best result so far.
+2026-05-06  22:00   OBC + act-aware + LoRA v3: PPL 1.281x — OBC regressed quality.
 ```
 
 ---
@@ -444,11 +446,64 @@ These were tried briefly but abandoned quickly. Documented for completeness.
 
 ---
 
+---
+
+## Experiment 10: OBC + Activation-Aware Thresholds + LoRA v3
+
+**Date**: 2026-05-06
+**Hardware**: Colab T4
+**Config**: PTBitNetConfig(symmetric, outliers=1%, OBC row compensation, activation-aware column weights) + LoRA (rank=64, distill=0.1, T=1.5, lr=5e-5, steps=1000, dense merge)
+**Commit**: `b7b5fec`
+
+### Results
+
+| Metric | Baseline FP16 | PT-BitNet + OBC + LoRA | Ratio |
+|--------|--------------|------------------------|-------|
+| PPL (diverse texts) | 3.16 | 4.04 | **1.281x** |
+| Gen quality | 82/100 | 88/100 | 1.07x |
+| Jaccard overlap | — | 0.19 | — |
+| Repetition | 0.00 | 0.072 | — |
+| Speed | — | 21.2 tok/s | — |
+| Pipeline time | — | 54.6 min | — |
+| Verdict | — | **GOOD** | |
+
+### Training Dynamics
+
+| Step | CE Loss | KD Loss |
+|------|---------|---------|
+| 1 | 6.81 | 10.75 |
+| 500 | 6.08 | 15.12 |
+| 1000 | 4.50 | 11.31 |
+
+### Comparison vs Previous Best (Exp 9: LoRA v3 without OBC)
+
+| Metric | Exp 9 (no OBC) | Exp 10 (OBC) | Delta |
+|--------|---------------|--------------|-------|
+| PPL ratio | **1.239x** | 1.281x | +0.042x worse |
+| Gen quality | 88/100 | 88/100 | same |
+| Pipeline time | 34.7 min | 54.6 min | +20 min slower |
+
+### Root Cause Analysis
+
+OBC and activation-aware thresholds were expected to improve PPL ratio from 1.239x → 1.12x. Instead, PPL regressed. Three likely mechanisms:
+
+1. **OBC over-compensation on small models**: The Hessian-weighted per-row bias correction is derived from GPTQ's block-wise framework (designed for 4-bit). For ternary (1.58-bit), the error per row is larger, and the OBC correction magnitude may overshoot — turning a quantization error into a systematic bias.
+
+2. **OBC-LoRA interaction**: LoRA was previously trained on ternary weights without OBC compensation. OBC changes the ternary error pattern that LoRA learns to correct. The LoRA adapters may be correcting for the "wrong" error distribution now.
+
+3. **Activation-aware column weights are myopic**: Per-layer column importance (based on that layer's input activations) ignores cross-layer effects. A column that looks "unimportant" for layer N's output may be critical for layer N+1's input representation.
+
+### Disposition
+
+OBC and activation-aware thresholds are **not recommended** for Phi-2 scale models. The simpler PT-BitNet + LoRA v3 configuration (Exp 9) remains the best result (PPL ratio 1.239x). OBC code is kept but the default pipeline should use `calibration_acts=False` for small models.
+
+---
+
 ## Summary: What We Learned
 
-**Total experiments**: 9 full + 11 technique failures = 20 documented attempts
-**Successful**: PT-BitNet (sym+outliers+comp), LoRA training dynamics
-**Failed**: Tequila, QAT, ITF+outliers, SSR, AGA, ITF-clamped, re-quantize, high-distill-KD, soft-temperature, per-element-Lambada
+**Total experiments**: 10 full + 11 technique failures = 21 documented attempts
+**Successful**: PT-BitNet (sym+outliers+comp), LoRA training dynamics, LoRA v3 dense merge
+**Failed**: Tequila, QAT, ITF+outliers, SSR, AGA, ITF-clamped, re-quantize, high-distill-KD, soft-temperature, per-element-Lambada, OBC+act-aware (regressed PPL)
 
 ### What works
 - Symmetric ternary + 1% outliers → solid baseline (PPL 1.32x)
@@ -470,6 +525,7 @@ These were tried briefly but abandoned quickly. Documented for completeness.
 - **Per-element Lambada**: Memory-prohibitive (2.5 GB for 7B)
 - **Full state_dict save**: System RAM exhaustion on Colab
 - **Stale custom_params**: Cached params corrupt fresh model loads
+- **OBC + activation-aware thresholds (small models)**: Over-compensation + LoRA interaction regressed PPL from 1.239x to 1.281x
 
 ### Open questions
 - Can LoRA with dense merge achieve PPL <1.15x?

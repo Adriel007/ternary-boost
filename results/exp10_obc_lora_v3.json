@@ -1,0 +1,42 @@
+{
+  "experiment": 10,
+  "date": "2026-05-06",
+  "hardware": "Colab T4 (15.6 GB VRAM, 12.7 GB RAM)",
+  "commit": "b7b5fec",
+  "config": {
+    "model": "microsoft/phi-2",
+    "quantization": "PT-BitNet symmetric ternary + 1% outliers + OBC row compensation + activation-aware column weights",
+    "lora": "rank=64, distill_weight=0.1, T=1.5, lr=5e-5, steps=1000, attention-only, dense merge",
+    "pipeline_stages": "PT-BitNet (87s) + LoRA (2526s) = 3274s total"
+  },
+  "results": {
+    "perplexity_quantized": 4.04,
+    "perplexity_baseline": 3.16,
+    "perplexity_ratio": 1.281,
+    "avg_generation_score": 88,
+    "baseline_generation_score": 82,
+    "avg_repetition": 0.072,
+    "jaccard_overlap": 0.19,
+    "avg_speed_tok_s": 21.2,
+    "pipeline_time_min": 54.6,
+    "verdict": "GOOD — minor quality loss, fully usable"
+  },
+  "per_prompt": [
+    {"category": "Geography", "quantized": 90, "baseline": 65},
+    {"category": "History", "quantized": 75, "baseline": 75},
+    {"category": "Science", "quantized": 75, "baseline": 85},
+    {"category": "Astronomy", "quantized": 75, "baseline": 85},
+    {"category": "Math", "quantized": 85, "baseline": 65},
+    {"category": "Logic", "quantized": 100, "baseline": 100},
+    {"category": "Definition", "quantized": 100, "baseline": 100},
+    {"category": "Comparison", "quantized": 100, "baseline": 100},
+    {"category": "Ethics", "quantized": 100, "baseline": 85},
+    {"category": "Creative", "quantized": 85, "baseline": 60}
+  ],
+  "comparison_vs_previous_best": {
+    "exp9_ppl_ratio": 1.239,
+    "exp10_ppl_ratio": 1.281,
+    "delta": "+0.042 (worse)",
+    "obc_helped": false
+  }
+}
