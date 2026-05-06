@@ -286,20 +286,79 @@ Re-quantization removed. Use `merge_lora_to_weights` (dense, no re-ternarize). S
 
 ## Experiment 9: LoRA Fine-Tuning v3 (dense merge, no re-quantize)
 
-**Date**: 2026-05-06 (pending)
+**Date**: 2026-05-06
 **Hardware**: Colab T4
-**Config**: rank=64, distill_weight=0.1, T=1.5, lr=5e-5, steps=1000, attention-only, dense merge (no re-quantize)
+**Config**: rank=64, distill_weight=0.1, T=1.5, lr=5e-5, steps=1000, attention-only (q/k/v), dense merge (no re-quantize)
 **Commit**: `4774cf9`
-
-### Expected
-
-- CE loss: ~4.0 (improved from baseline 5.86)
-- PPL ratio: 1.05-1.15x range (CE loss improvement should translate to PPL)
-- Weights: dense (bf16, 5.6 GB), same size as ternary in bf16
 
 ### Results
 
-*Pending Colab run.*
+| Metric | Baseline FP16 | PT-BitNet + LoRA v3 | Ratio |
+|--------|--------------|---------------------|-------|
+| PPL (diverse texts) | 3.16 | 3.91 | **1.239x** |
+| Gen quality | 82/100 | 88/100 | **1.07x** |
+| Jaccard overlap | — | 0.36 | — |
+| Repetition | 0.00 | 0.000 | — |
+| Speed | — | 19.2 tok/s | — |
+| VRAM peak | — | 6.0 GB | — |
+| Pipeline time | — | 34.7 min | — |
+| Verdict | — | **GOOD** | |
+
+### Training Dynamics
+
+| Step | CE Loss | KD Loss |
+|------|---------|---------|
+| 1 | 7.74 | 12.81 |
+| 500 | 5.28 | 10.88 |
+| 1000 | 4.09 | 10.31 |
+
+CE loss dropped 47% (7.74→4.09). Below without-LoRA baseline (~5.86).
+
+### Generation Samples
+
+| Prompt | Response | Correct? |
+|--------|----------|-----------|
+| "Capital of Japan?" | `Tokyo` | ✅ |
+| "WWII end year?" | `1945.` + relevant exercises | ✅ |
+| "Water symbol?" | `H2O` + water cycle exercises | ✅ |
+| "Planets count?" | `There are eight planets: Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, and Neptune.` | ✅ |
+| "5 apples × $2?" | `5 x $2 = $10` + explanation | ✅ |
+| "All dogs animals?" | `Yes` + logical deduction | ✅ |
+| "Photosynthesis?" | `Plants use sunlight, CO2, water → glucose + oxygen` | ✅ |
+| "Moon vs Earth?" | `Moon much smaller, Earth ~10x bigger` | ✅ |
+| "Lie ethical?" | `No, goes against honesty principle` | ✅ |
+| "Haiku ocean?" | `Waves crashing on the shore / Saltwater and seagull cries / Nature's symphony at play` | ✅ |
+
+### Comparison: All LoRA Versions
+
+| Version | PPL Ratio | Gen Quality | Pipeline | Key Difference |
+|---------|-----------|-------------|----------|----------------|
+| No LoRA (simple texts) | 1.324x | 94/100 | 10 min | PT-BitNet only |
+| v1 (bad KD, re-quantize) | 1.256x | 90/100 | 19 min | distill=0.5, T=3.0, rank=32 |
+| v2 (good KD, re-quantize) | 5.656x | 72/100 | 36 min | Re-quantize destroyed weights |
+| **v3 (good KD, dense)** | **1.239x** | **88/100** | 35 min | **Best overall** |
+
+### Analysis
+
+**What improved vs v1:**
+- PPL ratio: 1.256x → 1.239x (modest 1.7% gain on same texts)
+- Jaccard overlap: 0.20 → 0.36 (outputs more similar to baseline)
+- Creative tasks: v1 generated Python code, v3 generates actual haiku
+- Exercise relevance: v1 added random exercises, v3 adds context-appropriate follow-ups
+- No degeneration: 0.000 repetition (v1 had 0.005)
+
+**What didn't improve enough:**
+- PPL ratio gain vs no-LoRA is modest (~7% estimated, from 1.324x to 1.239x across different text sets)
+- Pipeline time tripled (10→35 min) for modest PPL gain
+- KD loss still high (10.31) — student diverged from teacher during training
+- CE loss improved (7.74→4.09) but initial loss was higher than without-LoRA
+- Model is more verbose than baseline (adds exercises)
+
+**Honest assessment:** LoRA + dense merge is a working quality improvement, but the cost (25 min extra) may not justify the benefit (~7% PPL improvement) for all use cases. For a quick compressed model, PT-BitNet alone (10 min) is sufficient. For maximum quality, LoRA v3 (35 min) provides better output formatting and factuality.
+
+### Disposition
+
+This is the recommended LoRA configuration. Dense merge preserves quality. Re-quantization is proven harmful and should not be used.
 
 ---
 
