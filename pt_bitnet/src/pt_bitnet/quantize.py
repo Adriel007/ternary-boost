@@ -289,10 +289,13 @@ def ternary_quantize_vectorized(
     # --- Activation-aware column weights ---
     col_weights = None
     if calibration_inputs is not None:
-        # Flatten all batch dims: [batch, seq, in_f] → [N, in_f]
         X_flat = calibration_inputs.float().reshape(-1, calibration_inputs.shape[-1])
         col_weights = (X_flat ** 2).mean(dim=0)  # [in_f] — per-input-channel importance
-        col_weights = col_weights / col_weights.mean().clamp_min(1e-8)
+        # Safety: fall back to uniform if activations have NaN/Inf or zero variance
+        if not torch.isfinite(col_weights).all() or col_weights.mean() < 1e-8:
+            col_weights = None
+        else:
+            col_weights = col_weights / col_weights.mean().clamp_min(1e-8)
 
     # --- Outlier identification (SpQR-style) ---
     if config.outlier_fraction > 0:
@@ -461,9 +464,14 @@ def apply_pt_bitnet(
     logger.info(f"PT-BitNet complete: {len(targets)} layers quantized "
                 f"(with activation-aware row compensation)")
 
-    # Optional: Hessian compensation on lm_head
-    if config.compensation_steps > 0 and tokenizer is not None and calibration_texts is not None:
+    # Hessian compensation on lm_head: only when activation collection failed
+    # (no OBC). When OBC ran, every layer's bias was already compensated —
+    # additional lm_head training would double-correct and risk overfitting.
+    if (config.compensation_steps > 0 and tokenizer is not None
+            and calibration_texts is not None and not calibration_acts):
         hessian_compensation(model, tokenizer, calibration_texts, config)
+    elif calibration_acts:
+        logger.info("Hessian compensation skipped — OBC row compensation already applied")
 
     return model
 
