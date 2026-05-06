@@ -289,9 +289,10 @@ def ternary_quantize_vectorized(
     # --- Activation-aware column weights ---
     col_weights = None
     if calibration_inputs is not None:
-        # Hessian diagonal: mean activation squared per input channel
-        col_weights = (calibration_inputs.float() ** 2).mean(dim=0)  # [in_f]
-        col_weights = col_weights / col_weights.mean().clamp_min(1e-8)  # normalize
+        # Flatten all batch dims: [batch, seq, in_f] → [N, in_f]
+        X_flat = calibration_inputs.float().reshape(-1, calibration_inputs.shape[-1])
+        col_weights = (X_flat ** 2).mean(dim=0)  # [in_f] — per-input-channel importance
+        col_weights = col_weights / col_weights.mean().clamp_min(1e-8)
 
     # --- Outlier identification (SpQR-style) ---
     if config.outlier_fraction > 0:
