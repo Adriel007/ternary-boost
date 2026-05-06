@@ -535,13 +535,21 @@ def _compress_and_cache(
             from pt_bitnet.lora import finetune_lora, LoRAConfig
 
             logger.info("  Loading FP16 teacher on CPU for logit pre-computation...")
+            # Move student to GPU BEFORE loading teacher on CPU.
+            # Student on CPU (5.6 GB) + Teacher on CPU (5.6 GB) = 11.2 GB
+            # Colab T4 has 12.7 GB RAM → OOM. Student must be on GPU first.
+            if has_cuda:
+                model.cuda()
+                torch.cuda.empty_cache()
+                import gc as _gc; _gc.collect()
+                logger.info("  Student moved to GPU, freeing CPU RAM for teacher")
+
             from transformers import AutoConfig
             teacher_config = AutoConfig.from_pretrained(
                 entry.path, trust_remote_code=True, cache_dir=str(hf_cache),
             )
             if not hasattr(teacher_config, "pad_token_id") or teacher_config.pad_token_id is None:
                 teacher_config.pad_token_id = 0
-            # Teacher stays on CPU — avoids GPU OOM. CPU forward is ~0.5s per text.
             teacher = AutoModelForCausalLM.from_pretrained(
                 entry.path, torch_dtype=dtype, low_cpu_mem_usage=True,
                 device_map="cpu", trust_remote_code=True, cache_dir=str(hf_cache),
