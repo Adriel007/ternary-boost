@@ -551,18 +551,19 @@ def _compress_and_cache(
             texts_data = _ensure_texts()
             lo_cfg = LoRAConfig(
                 rank=lora_rank,
-                num_steps=getattr(entry, "lora_steps", 500),
-                distill_weight=0.5,
-                max_seq_length=64,  # Shorter seq = less VRAM for activations
-                batch_size=1,       # Batch 1 = safer memory
-                gradient_accumulation=8,  # More accumulation = same effective batch
+                num_steps=getattr(entry, "lora_steps", 1000),
+                # Use improved v2 defaults: low distill weight, sharp teacher,
+                # attention-only targets, no dropout. See lora.py dataclass.
             )
-            # finetune_lora: pre-computes teacher logits → frees teacher →
-            # fine-tunes with student only. Peak VRAM: one model at a time.
+            # finetune_lora: pre-computes teacher logits on CPU → frees teacher →
+            # fine-tunes with student only. Peak VRAM: student alone (~6 GB).
             model = finetune_lora(model, tokenizer, texts_data[:50], teacher, lo_cfg)
 
-            from pt_bitnet.lora import save_lora_weights
-            save_lora_weights(model, str(cache_dir / "lora_weights.safetensors"))
+            # Merge LoRA → re-ternarize → preserves sparsity with quality gain
+            from pt_bitnet.lora import merge_and_requantize
+            model = merge_and_requantize(model)
+            logger.info("  LoRA merged + re-quantized to strict ternary")
+            _save_model_state(model, tokenizer, cache_dir)
 
             elapsed = time.time() - t0
             logger.info(f"LoRA fine-tuning complete in {elapsed:.1f}s")

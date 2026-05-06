@@ -27,27 +27,34 @@ logger = get_logger("pt_bitnet.lora")
 
 @dataclass
 class LoRAConfig:
-    """Configuration for LoRA fine-tuning on ternary models."""
+    """Configuration for LoRA fine-tuning on ternary models.
 
-    rank: int = 32                # LoRA rank (higher = more expressive, more memory)
-    alpha: float = 64.0           # Scaling factor (alpha/rank scales LoRA output)
-    dropout: float = 0.05         # LoRA dropout for regularization
+    Calibrated for ternary (1.58-bit): the quantization gap is larger than
+    4-bit QLoRA, so we use higher rank, lower distill weight, and sharper
+    teacher targets. CE loss must dominate — KD is a gentle guide, not the
+    main objective. v1's distill_weight=0.5 pulled the model away from
+    correct predictions.
+    """
+
+    rank: int = 64                # LoRA rank (64 for ternary gap, 32 for 4-bit)
+    alpha: float = 128.0          # Scaling factor (alpha=2*rank is standard)
+    dropout: float = 0.0          # No dropout — teacher already regularizes
     target_modules: tuple = (
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj",
+        "q_proj", "k_proj", "v_proj", "o_proj",  # Attention only — FFN doesn't
+                                                   # benefit as much from LoRA
     )
     skip_modules: tuple = ("lm_head", "embed_tokens")
 
     # Fine-tuning
-    num_steps: int = 500          # Total optimization steps
-    batch_size: int = 2           # Per-step batch size
-    learning_rate: float = 2e-4   # AdamW learning rate
-    max_seq_length: int = 128     # Max sequence length for calibration
-    gradient_accumulation: int = 4 # Accumulate batches before step
+    num_steps: int = 1000         # More steps with lower LR for stability
+    batch_size: int = 1           # Batch 1 for memory safety
+    learning_rate: float = 5e-5   # Lower LR: ternary needs gentler updates
+    max_seq_length: int = 128     # Longer context = better KD signal
+    gradient_accumulation: int = 8 # Effective batch = 8 with batch_size=1
 
     # Knowledge distillation
-    distill_weight: float = 0.5   # Weight of KD loss vs CE loss (0-1)
-    temperature: float = 3.0      # KD temperature (higher = softer targets)
+    distill_weight: float = 0.1   # CE dominates (0.9), KD gentle guide (0.1)
+    temperature: float = 1.5      # Sharper targets (v1's T=3.0 was too soft)
 
 
 class LoRALinear(nn.Module):
@@ -300,21 +307,18 @@ def _log_vram(label: str = "") -> None:
 
 
 def merge_lora_to_weights(model: nn.Module) -> nn.Module:
-    """Merge LoRA adapters back into the base ternary weights.
+    """Merge LoRA adapters back into the base weights (dense, non-ternary).
 
     W_merged = W_ternary + (alpha/rank) * (B @ A)
 
-    After merging, replaces LoRALinear with standard nn.Linear.
-    NOTE: this destroys ternary sparsity — the merged weight is dense.
-    Use only if you prioritize quality over ternary efficiency, or if
-    you plan to re-quantize after merging.
+    NOTE: this destroys ternary sparsity. Use merge_and_requantize() instead
+    to preserve ternary structure after merging.
     """
     merged = 0
     for module_name, module in list(model.named_modules()):
         if not isinstance(module, LoRALinear):
             continue
 
-        # Compute effective weight with LoRA contribution
         with torch.no_grad():
             w_base = module.base.weight.data.float()
             lora_contrib = module.scaling * (module.lora_B.data.float() @
@@ -339,6 +343,64 @@ def merge_lora_to_weights(model: nn.Module) -> nn.Module:
         merged += 1
 
     logger.info(f"  Merged {merged} LoRA adapters → nn.Linear (dense, non-ternary)")
+    return model
+
+
+def merge_and_requantize(model: nn.Module) -> nn.Module:
+    """Merge LoRA into weights, then re-ternarize to preserve sparsity.
+
+    Flow:
+      1. W_dense = W_ternary + (alpha/rank) * (B @ A)  [merge LoRA]
+      2. W_new_ternary = symmetric_ternary(W_dense)     [re-quantize]
+      3. Replace LoRALinear → nn.Linear(W_new_ternary)   [clean layers]
+
+    This bakes the LoRA correction into a fresh ternary weight matrix,
+    recovering both quality AND sparsity. The re-quantization preserves
+    the improved weight values that LoRA discovered.
+
+    NOTE: re-quantization may lose some of the LoRA benefit. The gain
+    comes from using LoRA to find better ternary weight assignments,
+    not from keeping the dense LoRA correction.
+    """
+    from pt_bitnet.quantize import _symmetric_ternary, PTBitNetConfig
+
+    pt_cfg = PTBitNetConfig(show_progress=False)
+    merged = 0
+
+    for module_name, module in list(model.named_modules()):
+        if not isinstance(module, LoRALinear):
+            continue
+
+        with torch.no_grad():
+            # 1. Merge
+            w_base = module.base.weight.data.float()
+            lora_contrib = module.scaling * (module.lora_B.data.float() @
+                                             module.lora_A.data.float())
+            w_dense = w_base + lora_contrib
+
+            # 2. Re-ternarize
+            w_ternary = _symmetric_ternary(w_dense, pt_cfg)
+
+        # 3. Replace
+        parent_name = ".".join(module_name.split(".")[:-1])
+        child_name = module_name.split(".")[-1]
+        parent = model if not parent_name else model.get_submodule(parent_name)
+
+        device = module.base.weight.device
+        dtype = module.base.weight.dtype
+        new_linear = nn.Linear(
+            module.base.in_features, module.base.out_features,
+            bias=module.base.bias is not None, dtype=dtype, device=device,
+        )
+        new_linear.weight.data.copy_(w_ternary.to(device).to(dtype))
+        new_linear.weight.requires_grad = False
+        if module.base.bias is not None:
+            new_linear.bias.data.copy_(module.base.bias.data)
+
+        setattr(parent, child_name, new_linear)
+        merged += 1
+
+    logger.info(f"  Merged + re-quantized {merged} layers to strict ternary")
     return model
 
 

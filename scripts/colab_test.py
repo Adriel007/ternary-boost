@@ -28,9 +28,10 @@ MODEL = "microsoft/phi-2"
 # LoRA fine-tuning (quality recovery after ternary quantization)
 # Memory-safe: teacher logits pre-computed on CPU, student trained alone.
 # Peak VRAM: ~6 GB (Phi-2). Fits T4 easily.
+# After LoRA: merged + re-quantized → strict ternary preserved
 ENABLE_LORA = True
-LORA_RANK = 32          # 16-64. Higher = better quality but more VRAM
-LORA_STEPS = 500        # 200 fast test, 500+ best quality
+LORA_RANK = 64          # 32 fast, 64 best quality (ternary gap needs capacity)
+LORA_STEPS = 1000       # 500 quick test, 1000+ best quality
 # ═══════════════════════════════════════════════════════════════════════
 
 # ── Setup ──────────────────────────────────────────────────────────

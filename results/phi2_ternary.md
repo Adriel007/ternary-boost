@@ -2,72 +2,88 @@
 
 **Date**: 2026-05-05
 **Hardware**: Colab T4 (15.6 GB VRAM, 12.7 GB RAM)
-**Pipeline**: PT-BitNet (symmetric ternary + 1% outliers + Hessian compensation)
-**Pipeline time**: 10.1 min
-**Code commit**: `ec0135b`
+**Code commit**: `091ade2`
 
 ## Active Pipeline Stages
 
 | Stage | Status | Reason |
 |-------|--------|--------|
-| 1. PT-BitNet | **Active** | Symmetric ternary + 1% outlier retention + 50-step Hessian compensation on lm_head |
-| 2. ParetoQ/QAT | Skipped | w_bits=1 uses sign() (binary), destroys ternary sparsity. w_bits=0 uses incompatible scaling |
-| 3. Tequila | Skipped | UltraQuantV3 recomputes ternary decomposition on PT-BitNet's denormalized weights (w*std+mean), producing a different pattern. PT-BitNet output is already optimal |
+| 1. PT-BitNet | Active | Symmetric ternary + 1% outlier retention + 50-step Hessian compensation |
+| 2. ParetoQ/QAT | Removed | sign() binary destroys ternary sparsity |
+| 3. Tequila | Removed | UltraQuantV3 re-decomposition incompatible with PT-BitNet denorm |
+| 4. LoRA | Active (v1 results below) | Rank-32 KD from FP16 teacher on CPU |
 
 ## Model: microsoft/phi-2 (2.78B params)
 
+### PT-BitNet only (no LoRA)
+
 | Metric | Baseline FP16 | Quantized (ternary) | Ratio |
 |--------|--------------|---------------------|-------|
-| **Perplexity** (calibration texts) | 2.61 | 3.45 | 1.32x |
-| **Perplexity** (wikitext train) | — | — | — |
-| **Generation quality** (avg 0-100) | 94 | 94 | 1.00x |
-| **Repetition ratio** | 0.00 | 0.00 | — |
-| **Speed** | — | 20.5 tok/s | — |
+| Perplexity (simple texts) | 2.61 | 3.45 | 1.32x |
+| Perplexity (diverse texts) | — | — | — |
+| Generation quality (avg 0-100) | 94 | 94 | 1.00x |
+| Repetition ratio | 0.00 | 0.00 | — |
+| Speed | — | 20.5 tok/s | — |
+| Pipeline time | — | 10.1 min | — |
+
+### PT-BitNet + LoRA (rank=32, v1)
+
+| Metric | Baseline FP16 | Quantized + LoRA | Ratio |
+|--------|--------------|------------------|-------|
+| Perplexity (diverse texts) | 3.16 | 3.96 | 1.256x |
+| Generation quality (avg 0-100) | 86 | 90 | 1.05x |
+| Repetition ratio | 0.00 | 0.005 | — |
+| Speed | — | 16.2 tok/s | — |
+| Pipeline time | — | 19.2 min | — |
+
+**LoRA v1 hyperparameters (suboptimal):**
+- Rank: 32, alpha: 64, dropout: 0.05
+- distill_weight: 0.5, temperature: 3.0, lr: 2e-4, steps: 500
+- max_seq_length: 64, accumulation: 8
+- Target: all 7 projection types (96 layers)
+
+**Analysis:**
+- PPL ratio improved only 5% (1.32x → 1.26x). Expected 15-25%.
+- CE loss increased during training (6.85 → 6.48 vs. without LoRA baseline of ~5.86)
+- KD loss remained high (6.28 at step 500) — student couldn't match teacher distribution
+- Root cause: distill_weight=0.5 pulled model away from correct predictions
+- T=3.0 made teacher targets too uniform (low information per token)
+- LoRA on FFN layers (gate/up/down) may have added noise without benefit
+- Model became verbose — adds exercises/questions after every response
+
+### Planned: LoRA v2 (improved config)
+
+| Parameter | v1 (bad) | v2 (planned) | Reason |
+|-----------|----------|--------------|--------|
+| distill_weight | 0.5 | 0.1 | CE should dominate, KD as gentle guide |
+| temperature | 3.0 | 1.5 | Sharper teacher = more informative |
+| rank | 32 | 64 | More capacity for ternary error gap |
+| lr | 2e-4 | 5e-5 | More stable, less overshoot |
+| steps | 500 | 1000 | More training with lower LR |
+| target_modules | All 7 types | q,k,v,o only | Attention benefits most from LoRA |
+| dropout | 0.05 | 0.0 | Teacher already regularizes |
+| max_seq_length | 64 | 128 | More context = better KD signal |
+| re-quantize | No | Yes | Merge LoRA → re-ternarize → preserve sparsity |
 
 ## Generation Samples
 
-### Factual: "What is the capital of France?"
+### PT-BitNet only
 
-| Model | Response |
-|-------|----------|
-| FP16 | `The capital of France is Paris.` |
-| Ternary | `The capital of France is Paris.` |
+| Prompt | Response |
+|--------|----------|
+| "Capital of France?" | `The capital of France is Paris.` |
+| "Machine learning?" | `Machine learning is a subset of artificial intelligence...` |
+| "Train 60mph 2h?" | `The train covers a distance of 120 miles...` |
 
-### Definition: "What is machine learning?"
+### PT-BitNet + LoRA v1
 
-| Model | Response |
-|-------|----------|
-| FP16 | `Machine learning is a subset of artificial intelligence that focuses on developing algorithms and models that enable com...` |
-| Ternary | `Machine learning is a subset of artificial intelligence where computers and machines are programmed to execute tasks aut...` |
+| Prompt | Response |
+|--------|----------|
+| "Capital of Japan?" | `Tokyo` (adds exercise about APEC) |
+| "WWII end?" | `World War II ended in 1945.` (adds exercise about countries involved) |
+| "Chemical symbol water?" | `H2O` (adds exercise about CO2) |
+| "Planets solar system?" | `There are eight planets...` (adds question about Jupiter moons) |
+| "Photosynthesis?" | `Photosynthesis is a process in plants where they use sunlight...` (correct, adds follow-up) |
+| "Haiku about ocean?" | Generates Python code instead of a haiku |
 
-### Math: "If a train travels at 60mph for 2 hours, how far?"
-
-| Model | Response |
-|-------|----------|
-| FP16 | `The train will travel 120 miles.` |
-| Ternary | `The train covers a distance of 120 miles...` |
-
-### Creative: "Write a short poem about the moon"
-
-| Model | Response |
-|-------|----------|
-| FP16 | `The moon is a silver coin / That shines in the dark night sky / It changes its shape and size / As it orbits by and by` |
-| Ternary | `The moon is a bright light that / That guides us on our way / ...` |
-
-## Analysis
-
-- **Perplexity degradation**: 32% increase is acceptable for 1.58-bit post-training quantization on a small model (2.7B). Smaller models have less weight redundancy, making compression harder.
-- **Generation quality**: Matches FP16 baseline (94/100). Factual knowledge, reasoning, and creativity are preserved.
-- **No degeneration**: Repetition ratio 0.00 — model does not collapse into loops or gibberish.
-- **Room for improvement**: Hessian compensation only reduced loss 2% (5.99→5.86). Better calibration data or iterative weight optimization could reduce PPL further.
-
-## Comparison to Literature
-
-| Method | Model Size | PPL Ratio | Training |
-|--------|-----------|-----------|----------|
-| **This work** | 2.7B | 1.32x | Post-training |
-| PT²-LLM (paper) | 7-70B | 1.15-1.25x | Post-training |
-| BitNet b1.58 | 3B | ~1.05x | Trained from scratch |
-| GPTQ (4-bit) | 7-70B | 1.05-1.15x | Post-training |
-
-Post-training ternary on small models is inherently harder — less parameter redundancy means each weight matters more. Our result is in line with expectations for a 2.7B model at 1.58 bits.
+LoRA v1 produces factually correct answers but is overly verbose, adding random exercises after each response.
