@@ -1,14 +1,19 @@
 """Model loading with automatic TernaryBoost compression pipeline.
 
-Any standard FP16 HuggingFace model is accepted. On first load, the full
-compression pipeline (PT-BitNet → ParetoQ+ZeroQAT → Tequila) is applied
-and the result cached. Subsequent loads reconstruct custom quantization
-layers (QuantizeLinear, UltraQuantLinear) from saved parameters.
+Any standard FP16 HuggingFace causal LM is accepted. On first load, the
+compression pipeline (PT-BitNet → optional LoRA-KD) is applied and the result
+cached as a sharded safetensors checkpoint. Subsequent loads reuse the cache.
 
-Critical: standard nn.Linear layers do NOT accelerate ternary inference.
-Custom layers (QuantizeLinear, UltraQuantLinear) must be reconstructed
-after loading from safetensors, as HuggingFace from_pretrained always
-creates standard architectures.
+The cache layout (per model) is::
+
+    cache/ternary/<safe_model_name>/
+        config.json, tokenizer.json, ...
+        model-00001-of-NNNNN.safetensors  (sharded ~800 MB chunks)
+        model.safetensors.index.json
+        lora_weights.safetensors          (if LoRA was applied)
+        stage1_done.txt                   (PT-BitNet checkpoint marker)
+        stage4_done.txt                   (LoRA checkpoint marker)
+        pipeline_metadata.json
 """
 
 import json
@@ -44,7 +49,8 @@ def _mark_stage_done(cache_dir: Path, stage: int, elapsed: float) -> None:
 
 
 def _is_fully_cached(cache_dir: Path) -> bool:
-    return _stage_done(cache_dir, 3)
+    """A model is considered ready if PT-BitNet (stage 1) has run."""
+    return _stage_done(cache_dir, 1)
 
 
 def load_model(entry: ModelEntry, cache_root: Optional[str] = None) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
@@ -67,31 +73,26 @@ def load_model(entry: ModelEntry, cache_root: Optional[str] = None) -> tuple[Pre
     return _compress_and_cache(entry, cache_dir, hf_cache)
 
 
-# ── Load with custom layer reconstruction ──────────────────────────────
-
 def _ensure_pipeline_imports():
     _project = Path(__file__).resolve().parent.parent.parent.parent
-    for _mod in ("shared", "pt_bitnet", "paretoq", "tequila", "eval"):
+    for _mod in ("shared", "pt_bitnet", "eval"):
         _src = str(_project / _mod / "src")
         if _src not in sys.path:
             sys.path.insert(0, _src)
 
 
 def _load_cached(cache_dir: Path, entry: ModelEntry) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
-    """Load cached ternary model and reconstruct custom quantization layers."""
+    """Load a cached ternary model. LoRA adapters are re-attached if present."""
     _ensure_pipeline_imports()
-    from safetensors.torch import load_file
 
     dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
     dtype = dtype_map.get(entry.dtype, torch.bfloat16)
 
-    # Fix: newer transformers requires pad_token_id on config
     from transformers import AutoConfig
-    config = AutoConfig.from_pretrained(
-        str(cache_dir), trust_remote_code=True,
-    )
+    config = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
     if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
         config.pad_token_id = 0
+
     model = AutoModelForCausalLM.from_pretrained(
         str(cache_dir), torch_dtype=dtype, low_cpu_mem_usage=True,
         device_map="cpu", trust_remote_code=True,
@@ -105,180 +106,30 @@ def _load_cached(cache_dir: Path, entry: ModelEntry) -> tuple[PreTrainedModel, P
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    custom_path = cache_dir / "custom_params.safetensors"
-    has_custom = custom_path.exists()
+    # Re-attach LoRA adapters if present
+    lora_path = cache_dir / "lora_weights.safetensors"
+    if lora_path.exists():
+        from pt_bitnet.lora import LoRAConfig, _add_lora_to_model, load_lora_weights
+        _add_lora_to_model(model, LoRAConfig())
+        load_lora_weights(model, str(lora_path))
+        logger.info("  LoRA adapters re-attached from cache")
 
-    if _stage_done(cache_dir, 3) and has_custom:
-        logger.info("Reconstructing Tequila UltraQuantLinear layers...")
-        from tequila.ultraquant import UltraQuantLinear, TequilaConfig
-        custom = load_file(str(custom_path))
-        config = TequilaConfig()
-        _reconstruct_ultraquant(model, custom, config)
-
-    elif _stage_done(cache_dir, 2) and has_custom:
-        logger.info("Reconstructing ParetoQ QuantizeLinear layers...")
-        from paretoq.utils_quant import QuantizeLinear
-        custom = load_file(str(custom_path))
-        _reconstruct_quantized(model, custom)
-
-    has_cuda = torch.cuda.is_available()
-    if has_cuda:
+    if torch.cuda.is_available():
         model = model.cuda()
     model.eval()
 
     params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Cached ternary model loaded: {params:,} parameters (layers reconstructed)")
+    logger.info(f"Cached ternary model loaded: {params:,} parameters")
     return model, tokenizer
 
 
-def _reconstruct_ultraquant(model: nn.Module, custom_params: dict, config) -> None:
-    """Replace nn.Linear with UltraQuantLinear, load Lambada, then bake to nn.Linear.
-
-    Baking pre-computes the effective ternary weight (A + deadzone contribution)
-    so inference uses a single standard matmul instead of the dual-linear
-    UltraQuantLinear forward (which is 2× slower on CPU).
-    """
-    from tequila.ultraquant import UltraQuantLinear, UltraQuantV3
-    _replace_with_custom(model, custom_params, config, UltraQuantLinear, "Lambada")
-    _bake_ultraquant_to_linear(model)
-
-
-def _bake_ultraquant_to_linear(model: nn.Module) -> None:
-    """Convert UltraQuantLinear layers to standard nn.Linear.
-
-    The Tequila forward pass is:
-        out = linear(input, A) + linear(ones, B * Lambada)
-
-    The second term adds a constant bias per output channel (same for all
-    tokens). To faithfully reproduce this in a standard nn.Linear:
-        weight = A           (ternary, preserves sparsity)
-        bias   = sum(B * Lambada, dim=-1)  (deadzone bias)
-
-    The old formula (A + B*L) was incorrect — it turned the deadzone
-    contribution into a full token-dependent matrix multiply, which
-    neither matches the Tequila forward nor preserves ternary sparsity.
-    """
-    from tequila.ultraquant import UltraQuantLinear, UltraQuantV3
-    skip_modules = ("lm_head", "embed_tokens")
-    target_modules = ("q_proj", "k_proj", "v_proj", "o_proj",
-                      "gate_proj", "up_proj", "down_proj")
-    baked = 0
-
-    embed_dtype = model.get_input_embeddings().weight.dtype
-
-    for module_name, module in model.named_modules():
-        if any(skip in module_name for skip in skip_modules):
-            continue
-        if not any(target in module_name for target in target_modules):
-            continue
-        if not isinstance(module, UltraQuantLinear):
-            continue
-
-        with torch.no_grad():
-            w = module.weight.data.float()
-            A, B = UltraQuantV3.apply(w, module.granularity, module.group_size)
-
-            # Weight = ternary A only (deadzone bias handled below)
-            effective_weight = A.float()
-
-            if hasattr(module, "Lambada"):
-                # linear(ones, B * Lambada) = sum(B * Lambada, dim=-1) per channel
-                deadzone_bias = (B.float() * module.Lambada.data.float()).sum(dim=-1)
-            else:
-                # v1/v2: linear(ones, B) → sum(B, dim=-1)
-                deadzone_bias = B.float().sum(dim=-1)
-
-        parent_name = ".".join(module_name.split(".")[:-1])
-        child_name = module_name.split(".")[-1]
-        parent = model if not parent_name else model.get_submodule(parent_name)
-
-        device = module.weight.device
-        new_linear = nn.Linear(
-            module.in_features, module.out_features,
-            bias=True, dtype=embed_dtype, device=device,
-        )
-        new_linear.weight.data.copy_(effective_weight.to(device))
-
-        # Combine original bias + deadzone contribution
-        if module.bias is not None:
-            combined_bias = module.bias.data.float() + deadzone_bias
-        else:
-            combined_bias = deadzone_bias
-        new_linear.bias.data.copy_(combined_bias.to(device))
-
-        setattr(parent, child_name, new_linear)
-        baked += 1
-
-    logger.info(f"  Baked {baked} UltraQuantLinear → nn.Linear (dtype={embed_dtype})")
-
-
-def _reconstruct_quantized(model: nn.Module, custom_params: dict) -> None:
-    """Replace nn.Linear with QuantizeLinear and load weight_clip_val."""
-    from paretoq.utils_quant import QuantizeLinear
-    _replace_with_custom(model, custom_params, None, QuantizeLinear, "weight_clip_val")
-
-
-def _replace_with_custom(model, custom_params, config, layer_cls, param_key):
-    """Generic layer replacement: nn.Linear → custom layer, loading custom params."""
-    skip_modules = ("lm_head", "embed_tokens")
-    target_modules = ("q_proj", "k_proj", "v_proj", "o_proj",
-                      "gate_proj", "up_proj", "down_proj")
-    replaced = 0
-    cls_name = layer_cls.__name__
-
-    for module_name, module in model.named_modules():
-        if any(skip in module_name for skip in skip_modules):
-            continue
-        if not any(target in module_name for target in target_modules):
-            continue
-        if not isinstance(module, nn.Linear):
-            continue
-
-        parent_name = ".".join(module_name.split(".")[:-1])
-        child_name = module_name.split(".")[-1]
-        parent = model if not parent_name else model.get_submodule(parent_name)
-
-        if cls_name == "UltraQuantLinear":
-            new_layer = layer_cls(
-                in_features=module.in_features,
-                out_features=module.out_features,
-                bias=module.bias is not None,
-                quant_method="ultraquantv3",
-                granularity="per_channel",
-                group_size=128,
-                range_of_lambada=0.01,
-                lambada_granularity=getattr(config, "lambada_granularity", "per_channel"),
-            )
-        else:
-            new_layer = layer_cls(
-                in_features=module.in_features,
-                out_features=module.out_features,
-                bias=module.bias is not None,
-                w_bits=1,
-            )
-
-        new_layer.weight.data.copy_(module.weight.data)
-        if module.bias is not None:
-            new_layer.bias.data.copy_(module.bias.data)
-
-        # Load custom param if available
-        full_key = f"{module_name}.{param_key}"
-        if full_key in custom_params:
-            getattr(new_layer, param_key).data.copy_(custom_params[full_key])
-
-        setattr(parent, child_name, new_layer)
-        replaced += 1
-
-    logger.info(f"  Reconstructed {replaced} layers with {layer_cls.__name__}")
-
-
-# ── Save with custom params ────────────────────────────────────────────
+# ── Save / load intermediate checkpoint ─────────────────────────────────
 
 def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
     """Save model as sharded safetensors to limit peak system RAM.
 
     Tensors are iterated one at a time from named_parameters() (no full
-    state_dict in memory), converted to bf16, and saved in 1 GB shards.
+    state_dict in memory), converted to bf16, and saved in 800 MB shards.
     HuggingFace from_pretrained loads sharded checkpoints natively via
     the index file.
     """
@@ -295,7 +146,7 @@ def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
     shard_files = []
     total_params = sum(1 for _ in model.named_parameters())
     param_count = 0
-    last_log = [0]  # mutable for progress tracking
+    last_log = [0]
 
     def _flush_shard():
         nonlocal shard_batch, shard_bytes, shard_idx
@@ -312,17 +163,10 @@ def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
         shard_idx += 1
 
     logger.info(f"Saving model ({total_params} params, sharded)...")
-    # Iterate tensors one at a time — no full state_dict in memory
-    custom_params = {}
     for key, param in model.named_parameters():
         param_count += 1
         tensor = param.detach().to(torch.bfloat16).cpu()
         nbytes = tensor.numel() * tensor.element_size()
-
-        # Custom params saved separately (small, < 10 MB total)
-        if "weight_clip_val" in key or "Lambada" in key:
-            custom_params[key] = tensor
-            continue
 
         shard_batch[key] = tensor
         shard_bytes += nbytes
@@ -334,7 +178,6 @@ def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
                 for k in keys:
                     weight_map[k] = fname
 
-        # Progress: log at 25%, 50%, 75%
         pct = 100 * param_count // total_params
         if pct >= last_log[0] + 25:
             logger.info(f"  Saving: {pct}% ({param_count}/{total_params} tensors)")
@@ -345,38 +188,26 @@ def _save_model_state(model, tokenizer, cache_dir: Path) -> None:
         for k in keys:
             weight_map[k] = fname
 
-    # Save or remove custom params
-    cp_path = str(cache_dir / "custom_params.safetensors")
-    if custom_params:
-        save_file(custom_params, cp_path)
-    elif os.path.exists(cp_path):
-        os.remove(cp_path)  # Clean stale custom_params from previous failed runs
-
-    # Fix the "XXXXX" placeholder in shard filenames
     total_shards = len(shard_files)
-    import os as _os
     for old_name, keys in shard_files:
         new_name = old_name.replace("XXXXX", f"{total_shards:05d}")
         if old_name != new_name:
-            _os.rename(str(cache_dir / old_name), str(cache_dir / new_name))
+            os.rename(str(cache_dir / old_name), str(cache_dir / new_name))
         for k in keys:
             weight_map[k] = new_name
 
-    # Write index file (HuggingFace-compatible sharded checkpoint)
-    import json as _json
-    total_params = sum(p.numel() for p in model.parameters())
+    total_params_count = sum(p.numel() for p in model.parameters())
     index = {
-        "metadata": {"total_size": total_params * 2},  # bf16 = 2 bytes
+        "metadata": {"total_size": total_params_count * 2},
         "weight_map": weight_map,
     }
     with open(str(cache_dir / "model.safetensors.index.json"), "w") as f:
-        _json.dump(index, f, indent=2)
+        json.dump(index, f, indent=2)
 
 
 def _load_model_state(cache_dir: Path, entry: ModelEntry) -> tuple:
     """Load intermediate model state (for pipeline resume)."""
     _ensure_pipeline_imports()
-    from safetensors.torch import load_file
 
     dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
     dtype = dtype_map.get(entry.dtype, torch.bfloat16)
@@ -389,16 +220,6 @@ def _load_model_state(cache_dir: Path, entry: ModelEntry) -> tuple:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Reconstruct layers that were applied in previous stages
-    custom_path = cache_dir / "custom_params.safetensors"
-    if custom_path.exists():
-        custom = load_file(str(custom_path))
-        if _stage_done(cache_dir, 3):
-            from tequila.ultraquant import TequilaConfig
-            _reconstruct_ultraquant(model, custom, TequilaConfig())
-        elif _stage_done(cache_dir, 2):
-            _reconstruct_quantized(model, custom)
-
     return model, tokenizer
 
 
@@ -407,7 +228,16 @@ def _load_model_state(cache_dir: Path, entry: ModelEntry) -> tuple:
 def _compress_and_cache(
     entry: ModelEntry, cache_dir: Path, hf_cache: Path
 ) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
-    """Run the full TernaryBoost pipeline with incremental checkpoints."""
+    """Run the TernaryBoost pipeline with incremental checkpoints.
+
+    Stages:
+      1. PT-BitNet — symmetric ternary + 1% outliers + lm_head Hessian comp
+      4. LoRA fine-tuning — KD from FP16 teacher (only if entry.lora_rank > 0)
+
+    Stage numbers are non-contiguous to preserve compatibility with prior
+    cache layouts; stages 2 and 3 (formerly ParetoQ and Tequila) were
+    permanently removed — see results/history.md.
+    """
     _ensure_pipeline_imports()
 
     from pt_bitnet import apply_pt_bitnet, PTBitNetConfig
@@ -420,7 +250,6 @@ def _compress_and_cache(
     dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
     dtype = dtype_map.get(entry.dtype, torch.bfloat16)
 
-    # Load base or resume
     if _stage_done(cache_dir, 1):
         logger.info("Stage 1 checkpoint found — resuming from PT-BitNet output")
         model, tokenizer = _load_model_state(cache_dir, entry)
@@ -428,7 +257,6 @@ def _compress_and_cache(
         logger.info("=" * 50)
         logger.info(f"Loading base model: {entry.path}")
         t0 = time.time()
-        # Fix: newer transformers requires pad_token_id on config
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(
             entry.path, trust_remote_code=True, cache_dir=str(hf_cache),
@@ -448,7 +276,6 @@ def _compress_and_cache(
         logger.info(f"Base model loaded in {time.time() - t0:.1f}s "
                     f"({sum(p.numel() for p in model.parameters()):,} params)")
 
-    # Calibration data (cached after first load, used by all stages)
     texts = None
 
     def _ensure_texts():
@@ -465,14 +292,15 @@ def _compress_and_cache(
     # Stage 1: PT-BitNet
     if not _stage_done(cache_dir, 1):
         logger.info("=" * 50)
-        logger.info("Stage 1/3: PT-BitNet post-training quantization")
+        logger.info("Stage 1: PT-BitNet post-training quantization")
         t0 = time.time()
         comp_steps = 50 if has_cuda else 10
+        # Symmetric: ITF (asymmetric=True) is incompatible with outliers
         model = apply_pt_bitnet(
             model,
             PTBitNetConfig(block_size=128, outlier_clip_threshold=3.0,
                            outlier_fraction=0.01, compensation_steps=comp_steps,
-                           asymmetric=False),  # Symmetric: ITF incompatible with outliers
+                           asymmetric=False),
             tokenizer=tokenizer,
             calibration_texts=_ensure_texts()[:32],
         )
@@ -481,68 +309,35 @@ def _compress_and_cache(
         _save_model_state(model, tokenizer, cache_dir)
         _mark_stage_done(cache_dir, 1, elapsed)
     else:
-        logger.info("Stage 1/3: PT-BitNet [SKIPPED]")
-
-    # Stage 2: Intentionally skipped — Tequila provides ternary-aware QAT (see README)
-    # ParetoQ code is retained in paretoq/ as a research artifact.
-    # QuantizeLinear lacks a native ternary mode: w_bits=1 is binary {-1, +1}
-    # and w_bits=0 uses StretchedElasticQuant which scales weights by 0.667,
-    # both incompatible with PT-BitNet's {-α, 0, +α} output.
-    if not _stage_done(cache_dir, 2):
-        logger.info("Stage 2/3: ParetoQ/ZeroQAT [SKIPPED — Tequila provides ternary-aware optimization]")
-        _mark_stage_done(cache_dir, 2, 0)
-    else:
-        logger.info("Stage 2/3: ParetoQ/ZeroQAT [SKIPPED]")
-        model, tokenizer = _load_model_state(cache_dir, entry)
-
-    # Stage 3: Tequila intentionally skipped.
-    # PT-BitNet denormalizes weights (w*std + mean), shifting them away from
-    # zero. UltraQuantV3 recomputes the ternary decomposition from scratch
-    # using its own threshold (mean(|w|)/2), which produces a DIFFERENT
-    # ternary pattern than PT-BitNet. Combined with the incorrect baking
-    # formula that was present in earlier versions, this destroyed quality.
-    # PT-BitNet sym+comp alone is sufficient — ablation proves it matches
-    # FP16 output. Tequila code is retained in tequila/ as a research
-    # artifact for future quantization-aware training.
-    if not _stage_done(cache_dir, 3):
-        logger.info("Stage 3/3: Tequila [SKIPPED — PT-BitNet denorm incompatible with UltraQuantV3 re-decomposition]")
-        _mark_stage_done(cache_dir, 3, 0)
-    else:
-        logger.info("Stage 3/3: Tequila [SKIPPED]")
-        model, tokenizer = _load_model_state(cache_dir, entry)
+        logger.info("Stage 1: PT-BitNet [SKIPPED — checkpoint exists]")
 
     # Stage 4: LoRA fine-tuning (quality recovery)
-    # Adds small trainable rank-decomposition adapters on top of frozen
-    # ternary weights. Fine-tuned with knowledge distillation from the
-    # FP16 teacher. LoRA weights are saved separately — the ternary
-    # backbone stays untouched for fast inference.
+    # Adds rank-decomposition adapters on top of frozen ternary weights,
+    # fine-tuned via KD from the FP16 teacher. LoRA weights are saved
+    # separately so the ternary backbone stays untouched for INT2 export.
     # Set lora_rank=0 in ModelEntry to skip.
     lora_rank = getattr(entry, "lora_rank", 0)
     if lora_rank > 0 and not _stage_done(cache_dir, 4):
         logger.info("=" * 50)
-        logger.info(f"Stage 4/4: LoRA fine-tuning (rank={lora_rank}, quality recovery)")
+        logger.info(f"Stage 4: LoRA fine-tuning (rank={lora_rank}, quality recovery)")
         t0 = time.time()
 
-        # Check VRAM: teacher and student alternate on GPU (not simultaneous)
-        # Peak: teacher alone (~6 GB for Phi-2) or student+LoRA (~6 GB)
         if has_cuda:
             vram_total = torch.cuda.get_device_properties(0).total_memory / 1e9
-            est_model = sum(p.numel() for p in model.parameters()) * 2 / 1e9  # bf16
-            if vram_total < est_model * 1.8:  # Need ~1.8x model size for safe operation
+            est_model = sum(p.numel() for p in model.parameters()) * 2 / 1e9
+            if vram_total < est_model * 1.8:
                 logger.warning(f"  VRAM tight for LoRA (GPU={vram_total:.1f} GB, "
                                f"model={est_model:.1f} GB). Attempting anyway...")
 
             from pt_bitnet.lora import finetune_lora, LoRAConfig
 
             logger.info("  Loading FP16 teacher on CPU for logit pre-computation...")
-            # Move student to GPU BEFORE loading teacher on CPU.
-            # Student on CPU (5.6 GB) + Teacher on CPU (5.6 GB) = 11.2 GB
-            # Colab T4 has 12.7 GB RAM → OOM. Student must be on GPU first.
-            if has_cuda:
-                model.cuda()
-                torch.cuda.empty_cache()
-                import gc as _gc; _gc.collect()
-                logger.info("  Student moved to GPU, freeing CPU RAM for teacher")
+            # Move student to GPU before loading teacher on CPU.
+            # Otherwise student (5.6 GB) + teacher (5.6 GB) = 11.2 GB > Colab T4 RAM (12.7 GB).
+            model.cuda()
+            torch.cuda.empty_cache()
+            gc.collect()
+            logger.info("  Student moved to GPU, freeing CPU RAM for teacher")
 
             from transformers import AutoConfig
             teacher_config = AutoConfig.from_pretrained(
@@ -560,18 +355,16 @@ def _compress_and_cache(
             lo_cfg = LoRAConfig(
                 rank=lora_rank,
                 num_steps=getattr(entry, "lora_steps", 1000),
-                # Use improved v2 defaults: low distill weight, sharp teacher,
-                # attention-only targets, no dropout. See lora.py dataclass.
             )
-            # finetune_lora: pre-computes teacher logits on CPU → frees teacher →
-            # fine-tunes with student only. Peak VRAM: student alone (~6 GB).
+            # finetune_lora pre-computes teacher logits on CPU, frees the teacher,
+            # then fine-tunes the student alone. Peak VRAM: student (~6 GB on Phi-2).
             model = finetune_lora(model, tokenizer, texts_data[:50], teacher, lo_cfg)
 
             # LoRA storage policy:
             #   merge_lora=True  → merge LoRA into dense weights (no re-quantize).
-            #                     W_dense = W_ternary + LoRA. 5.6 GB, PPL ~1.24x.
-            #   merge_lora=False → keep LoRA adapters separate from ternary
-            #                     weights. Enables INT2 export for 3.8x compression.
+            #                     5.6 GB on disk, PPL ~1.24× — destroys INT2 export.
+            #   merge_lora=False → keep LoRA adapters separate (default).
+            #                     Required for INT2 export and the hybrid runtime.
             merge = getattr(entry, "merge_lora", False)
             if merge:
                 from pt_bitnet.lora import merge_lora_to_weights
@@ -589,27 +382,23 @@ def _compress_and_cache(
             logger.info("  LoRA requires GPU — skipping on CPU")
             _mark_stage_done(cache_dir, 4, 0)
     elif lora_rank == 0:
-        logger.info("Stage 4/4: LoRA [SKIPPED — lora_rank=0]")
+        logger.info("Stage 4: LoRA [SKIPPED — lora_rank=0]")
         if not _stage_done(cache_dir, 4):
             _mark_stage_done(cache_dir, 4, 0)
     else:
-        logger.info("Stage 4/4: LoRA [SKIPPED]")
-        # Try loading LoRA weights if they exist
+        logger.info("Stage 4: LoRA [SKIPPED — checkpoint exists]")
         lora_path = cache_dir / "lora_weights.safetensors"
         if lora_path.exists() and not any("lora" in n for n, _ in model.named_parameters()):
             from pt_bitnet.lora import LoRAConfig, _add_lora_to_model, load_lora_weights
             _add_lora_to_model(model, LoRAConfig())
             load_lora_weights(model, str(lora_path))
             logger.info("  Loaded LoRA weights from cache")
-        else:
-            model, tokenizer = _load_model_state(cache_dir, entry)
 
-    # Final metadata
     total_time = time.time() - total_start
     meta = {
-        "source_model": entry.path, "pipeline_version": "1.0",
+        "source_model": entry.path, "pipeline_version": "2.0",
         "total_time_s": total_time,
-        "stages_applied": ["pt_bitnet", "lora"],
+        "stages_applied": ["pt_bitnet"] + (["lora"] if lora_rank > 0 else []),
         "params": sum(p.numel() for p in model.parameters()),
         "device": "GPU" if has_cuda else "CPU",
     }
@@ -646,7 +435,7 @@ def list_cache(cache_root: Optional[str] = None) -> list[dict]:
         return entries
     for d in sorted(ternary_cache.iterdir()):
         meta_file = d / "pipeline_metadata.json"
-        stages_done = sum(1 for s in (1, 2, 3) if (d / f"stage{s}_done.txt").exists())
+        stages_done = sum(1 for s in (1, 4) if (d / f"stage{s}_done.txt").exists())
         if meta_file.exists():
             meta = json.loads(meta_file.read_text())
             meta["stages_done"] = stages_done

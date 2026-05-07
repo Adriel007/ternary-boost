@@ -1,7 +1,7 @@
 [project]
 name = "ternary-boost"
-version = "0.1.0"
-description = "Hybrid LLM compression pipeline: PT-BitNet + ParetoQ + ZeroQAT + Tequila"
+version = "0.2.0"
+description = "Universal post-training ternarization pipeline for HuggingFace causal LMs (PT-BitNet + LoRA-KD)"
 requires-python = ">=3.10"
 dependencies = [
     "wandb>=0.16.0",
@@ -29,8 +29,6 @@ dev = [
 [tool.uv.workspace]
 members = [
     "pt_bitnet",
-    "paretoq",
-    "tequila",
     "eval",
     "shared",
     "chat",

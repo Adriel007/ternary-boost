@@ -41,7 +41,7 @@ if not os.path.exists(os.path.join(ROOT, "pyproject.toml")):
     if not os.path.exists(os.path.join(ROOT, "pyproject.toml")):
         raise RuntimeError("Not in ternary-boost directory. Run: %cd ternary-boost")
 
-for m in ["shared", "pt_bitnet", "tequila", "chat"]:
+for m in ["shared", "pt_bitnet", "chat"]:
     sys.path.insert(0, os.path.join(m, "src"))
 
 import torch
