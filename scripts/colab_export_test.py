@@ -25,6 +25,7 @@ LORA_RANK = 64
 LORA_STEPS = 1000
 EXPORT_DIR = "/content/exported_phi2"
 CKPT_DIR = f"/content/export_checkpoints/{MODEL.replace('/', '__')}"
+WIKITEXT_SAMPLES = 500  # number of WikiText-2 test lines for PPL eval
 # ═══════════════════════════════════════════════════════════════════════
 
 ROOT = os.getcwd()
@@ -130,8 +131,64 @@ def _load_lora_ckpt(model, stage):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# WikiText-2 PPL — standard benchmark metric for LLM quantization
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def compute_wikitext_ppl(model, tokenizer, max_samples=500, max_len=512):
+    """Evaluate perplexity on WikiText-2 test split.
+
+    This is the standard metric in quantization papers (GPTQ, SpQR, PB-LLM).
+    Returns (ppl, total_tokens) or (inf, 0) on failure.
+    """
+    try:
+        from datasets import load_dataset
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test",
+                               streaming=True)
+    except Exception:
+        print("  [!] Could not load WikiText-2, falling back to custom texts")
+        return None, 0
+
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    count = 0
+    has_cuda = next(model.parameters()).device.type == "cuda"
+
+    with torch.no_grad():
+        for item in dataset:
+            text = item["text"].strip()
+            if not text:
+                continue
+            if count >= max_samples:
+                break
+            enc = tokenizer(text, return_tensors="pt", truncation=True,
+                           max_length=max_len)
+            input_ids = enc["input_ids"]
+            if has_cuda:
+                input_ids = input_ids.cuda()
+            if input_ids.numel() < 2:
+                continue
+            out = model(input_ids=input_ids, labels=input_ids)
+            nll = out.loss.item() * (input_ids.numel() - 1)
+            total_loss += nll
+            total_tokens += input_ids.numel() - 1
+            count += 1
+            if count % 100 == 0:
+                current_ppl = math.exp(total_loss / max(total_tokens, 1))
+                print(f"  WikiText-2 {count}/{max_samples}... ppl={current_ppl:.2f}",
+                      flush=True)
+
+    if total_tokens == 0:
+        return float("inf"), 0
+    ppl = math.exp(total_loss / total_tokens)
+    return ppl, total_tokens
+
+
+# ═══════════════════════════════════════════════════════════════════════
 
 resumed_stages = []
+baseline_ppl = None  # set after FP16 evaluation
 
 print("=" * 60)
 print("TernaryBoost Export Pipeline Test")
@@ -187,6 +244,20 @@ else:
 
 n_params = sum(p.numel() for p in model.parameters())
 print(f"  Loaded {n_params:,} params in {time.time()-t0:.1f}s")
+
+# ── FP16 baseline (WikiText-2) ──────────────────────────────────────
+if has_cuda and not _has_ckpt("stage2_pt_bitnet"):
+    # Model is fresh FP16 on GPU — measure reference PPL before quantization
+    print("\n─ FP16 baseline (WikiText-2 test) ─")
+    model.cuda()
+    t_bl = time.time()
+    baseline_ppl, bl_tokens = compute_wikitext_ppl(
+        model, tokenizer, max_samples=WIKITEXT_SAMPLES)
+    if baseline_ppl is not None:
+        print(f"  FP16 PPL: {baseline_ppl:.2f} ({bl_tokens:,} tokens, "
+              f"{time.time()-t_bl:.0f}s)")
+    else:
+        print("  Skipped — datasets not available")
 
 # ── Step 2: PT-BitNet quantization ───────────────────────────────────
 print("\n[2/5] PT-BitNet quantization...")
@@ -359,7 +430,23 @@ def compute_ppl(model, tokenizer, texts, max_len=256):
 
 
 ppl = compute_ppl(model_loaded, tokenizer, TEXTS)
-print(f"  PPL (diverse texts): {ppl:.2f}")
+print(f"  PPL (8 diverse texts): {ppl:.2f}")
+
+# ── WikiText-2 PPL (standard benchmark) ─────────────────────────────
+print("\n─ WikiText-2 PPL (ternary model) ─")
+t_wt = time.time()
+ternary_ppl, wt_tokens = compute_wikitext_ppl(
+    model_loaded, tokenizer, max_samples=WIKITEXT_SAMPLES)
+if ternary_ppl is not None and baseline_ppl is not None:
+    ratio = ternary_ppl / baseline_ppl
+    print(f"  Ternary PPL: {ternary_ppl:.2f} ({wt_tokens:,} tokens, "
+          f"{time.time()-t_wt:.0f}s)")
+    print(f"  FP16 baseline: {baseline_ppl:.2f}")
+    print(f"  Degradation: {ratio:.3f}x ({(ratio - 1.0) * 100:+.1f}%)")
+elif ternary_ppl is not None:
+    print(f"  Ternary PPL: {ternary_ppl:.2f} ({wt_tokens:,} tokens, "
+          f"{time.time()-t_wt:.0f}s)")
+    print(f"  (no FP16 baseline for comparison)")
 
 # ── Quick generation test ────────────────────────────────────────────
 print("\n─ Quick generation test ─")
@@ -420,7 +507,14 @@ if ENABLE_LORA:
     print(f"  LoRA time:          {lora_elapsed/60:.1f} min")
 print(f"  Export time:        {export_elapsed:.1f}s")
 print(f"  Load time:          {load_elapsed:.1f}s")
-print(f"  PPL (diverse):      {ppl:.2f}")
+print(f"  PPL (8 texts):      {ppl:.2f}")
+if baseline_ppl is not None and ternary_ppl is not None:
+    deg = (ternary_ppl / baseline_ppl - 1.0) * 100
+    print(f"  WikiText-2 FP16:    {baseline_ppl:.2f}")
+    print(f"  WikiText-2 ternary: {ternary_ppl:.2f}")
+    print(f"  Degradation:        {ternary_ppl/baseline_ppl:.3f}x ({deg:+.1f}%)")
+elif ternary_ppl is not None:
+    print(f"  WikiText-2 PPL:     {ternary_ppl:.2f}")
 print(f"  Export size:        {total_bytes/1e6:.1f} MB")
 print(f"  Compression:        {ratio:.1f}x")
 print(f"  Ternary layers:     {ternary_count}")
