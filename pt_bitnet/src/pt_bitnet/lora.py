@@ -251,7 +251,8 @@ def finetune_lora(
                 # IDs and sequence lengths match the student's view.
                 for j in range(len(batch_texts)):
                     sample_len = (inputs["attention_mask"][j] == 1).sum().item()
-                    logits_j = out.logits[j, :sample_len].detach().cpu()
+                    # Keep batch dim [1, seq_len, vocab] to match training loop
+                    logits_j = out.logits[j, :sample_len].unsqueeze(0).detach().cpu()
                     teacher_logits_cache.append(logits_j)
                 del out, inputs
 
