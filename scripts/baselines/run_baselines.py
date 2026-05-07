@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 # Allow running from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -43,6 +43,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from shared.logging import get_logger
 
 logger = get_logger("baselines")
+
+
+def _safe_config(model_id: str):
+    """Load config with ``pad_token_id`` guaranteed set."""
+    config = AutoConfig.from_pretrained(model_id)
+    if getattr(config, "pad_token_id", None) is None:
+        config.pad_token_id = getattr(config, "eos_token_id", 0) or 0
+    return config
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Standard evaluation protocol (PLAN.md Section 7.1)
@@ -209,10 +218,9 @@ def baseline_autoround(model_id: str, device: str) -> Optional[dict]:
     t0 = time.time()
 
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto")
+        model = AutoModelForCausalLM.from_pretrained(model_id, config=_safe_config(model_id), torch_dtype="auto")
         tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-        # Calibration
         from datasets import load_dataset
         calib = load_dataset("allenai/c4", "en", split="validation", streaming=True)
         calib_texts = []
@@ -332,9 +340,11 @@ def baseline_ternaryboost(model_id: str, device: str) -> Optional[dict]:
         from pt_bitnet.lora import finetune_lora, LoRAConfig
         from eval.benchmarks import evaluate_model
 
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16)
+        cfg = _safe_config(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id, config=cfg, torch_dtype=torch.float16)
         tokenizer = AutoTokenizer.from_pretrained(model_id)
-        teacher = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16)
+        teacher_cfg = _safe_config(model_id)
+        teacher = AutoModelForCausalLM.from_pretrained(model_id, config=teacher_cfg, torch_dtype=torch.float16)
 
         model.to(device)
         teacher.to(device)
@@ -384,7 +394,7 @@ def baseline_fp16(model_id: str, device: str) -> dict:
     """FP16 teacher PPL (upper bound)."""
     logger.info("=== Baseline 0: FP16 teacher ===")
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained(model_id, config=_safe_config(model_id), torch_dtype=torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model.to(device)
 

@@ -6,7 +6,28 @@ from typing import Optional
 
 import torch
 from safetensors.torch import save_file, load_file
-from transformers import PreTrainedModel, PreTrainedTokenizer
+from transformers import AutoConfig, PreTrainedModel, PreTrainedTokenizer
+
+
+def ensure_pad_token_id(model_id: str | Path, **kwargs):
+    """Load config and guarantee ``pad_token_id`` is set.
+
+    Phi-2 and some older models ship without ``pad_token_id`` in their
+    config, causing ``AttributeError`` in ``PhiModel.__init__`` with
+    recent transformers versions. This helper loads the config, sets a
+    default if missing, and returns it ready for ``from_pretrained``.
+
+    Args:
+        model_id: HF model ID or local path.
+        **kwargs: forwarded to ``AutoConfig.from_pretrained``.
+
+    Returns:
+        Config with ``pad_token_id`` guaranteed non-None.
+    """
+    config = AutoConfig.from_pretrained(model_id, **kwargs)
+    if getattr(config, "pad_token_id", None) is None:
+        config.pad_token_id = getattr(config, "eos_token_id", 0) or 0
+    return config
 
 
 def save_checkpoint(

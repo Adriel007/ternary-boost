@@ -212,8 +212,11 @@ def _load_model_state(cache_dir: Path, entry: ModelEntry) -> tuple:
     dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
     dtype = dtype_map.get(entry.dtype, torch.bfloat16)
 
+    _cfg = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
+    if getattr(_cfg, "pad_token_id", None) is None:
+        _cfg.pad_token_id = getattr(_cfg, "eos_token_id", 0) or 0
     model = AutoModelForCausalLM.from_pretrained(
-        str(cache_dir), torch_dtype=dtype, low_cpu_mem_usage=True,
+        str(cache_dir), config=_cfg, torch_dtype=dtype, low_cpu_mem_usage=True,
         device_map="cpu", trust_remote_code=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(str(cache_dir), trust_remote_code=True)

@@ -122,8 +122,11 @@ def warmup_subln(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+    if getattr(config, "pad_token_id", None) is None:
+        config.pad_token_id = getattr(config, "eos_token_id", 0) or 0
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=dtype, trust_remote_code=False,
+        args.model, config=config, torch_dtype=dtype, trust_remote_code=False,
     )
     model.to(device)
 

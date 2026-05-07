@@ -1,4 +1,4 @@
-from .checkpoint import save_checkpoint, load_checkpoint, copy_config
+from .checkpoint import save_checkpoint, load_checkpoint, copy_config, ensure_pad_token_id
 from .logging import get_logger, log_memory_usage, MetricsTracker
 from .data import (
     load_calibration_texts,
@@ -12,6 +12,7 @@ __all__ = [
     "save_checkpoint",
     "load_checkpoint",
     "copy_config",
+    "ensure_pad_token_id",
     "get_logger",
     "log_memory_usage",
     "MetricsTracker",
