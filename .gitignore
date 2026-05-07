@@ -53,3 +53,4 @@ Thumbs.db
 .env.local
 *.secret
 exported_phi2.zip
+.claude/
