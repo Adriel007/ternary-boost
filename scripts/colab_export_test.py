@@ -20,7 +20,7 @@ os.environ.setdefault("HF_HOME", "/content/cache/huggingface")
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════
 MODEL = "microsoft/phi-2"
-ENABLE_LORA = False          # True = testa export COM LoRA (~50 min)
+ENABLE_LORA = True  # True = testa export COM LoRA (~50 min)
 LORA_RANK = 64
 LORA_STEPS = 1000
 EXPORT_DIR = "/content/exported_phi2"
@@ -42,9 +42,12 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 from pt_bitnet import (
-    apply_pt_bitnet, PTBitNetConfig,
-    export_ternary_lora, load_ternary_lora,
-    pack_int2, unpack_int2,
+    apply_pt_bitnet,
+    PTBitNetConfig,
+    export_ternary_lora,
+    load_ternary_lora,
+    pack_int2,
+    unpack_int2,
     TernaryInferenceLinear,
 )
 from pt_bitnet.int2_packing import verify_roundtrip
@@ -63,7 +66,9 @@ print("\n[0/5] INT2 packing verification...")
 t0 = time.time()
 results = verify_roundtrip()
 all_ok = all(r["match"] for r in results.values())
-print(f"  {'OK' if all_ok else 'FAIL'} — {len(results)} sizes tested in {time.time()-t0:.1f}s")
+print(
+    f"  {'OK' if all_ok else 'FAIL'} — {len(results)} sizes tested in {time.time()-t0:.1f}s"
+)
 if not all_ok:
     print("  FAILED sizes:", [k for k, v in results.items() if not v["match"]])
     sys.exit(1)
@@ -81,8 +86,12 @@ if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
     config.pad_token_id = 0
 
 model = AutoModelForCausalLM.from_pretrained(
-    MODEL, torch_dtype=dtype, low_cpu_mem_usage=True,
-    device_map="cpu", trust_remote_code=True, config=config,
+    MODEL,
+    torch_dtype=dtype,
+    low_cpu_mem_usage=True,
+    device_map="cpu",
+    trust_remote_code=True,
+    config=config,
 )
 tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
 if tokenizer.pad_token is None:
@@ -123,11 +132,16 @@ if ENABLE_LORA:
     if has_cuda:
         model.cuda()
         torch.cuda.empty_cache()
-        import gc as _gc; _gc.collect()
+        import gc as _gc
+
+        _gc.collect()
 
     teacher = AutoModelForCausalLM.from_pretrained(
-        MODEL, torch_dtype=dtype, low_cpu_mem_usage=True,
-        device_map="cpu", trust_remote_code=True,
+        MODEL,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+        device_map="cpu",
+        trust_remote_code=True,
     )
 
     lo_cfg = LoRAConfig(rank=LORA_RANK, num_steps=LORA_STEPS)
@@ -166,7 +180,9 @@ for fname, sz in sorted(file_sizes.items(), key=lambda x: -x[1]):
 # Compression ratio vs FP16
 fp16_size = n_params * 2  # 2 bytes per param
 ratio = fp16_size / total_bytes
-print(f"  Compression: {fp16_size/1e9:.2f} GB (FP16) → {total_bytes/1e9:.2f} GB = {ratio:.1f}x")
+print(
+    f"  Compression: {fp16_size/1e9:.2f} GB (FP16) → {total_bytes/1e9:.2f} GB = {ratio:.1f}x"
+)
 
 # ── Step 5: Load back and verify ─────────────────────────────────────
 print("\n[5/5] Loading exported model and verifying equivalence...")
@@ -182,7 +198,9 @@ load_elapsed = time.time() - t0
 print(f"  Loaded in {load_elapsed:.1f}s")
 
 # Count TernaryInferenceLinear layers
-ternary_count = sum(1 for m in model_loaded.modules() if isinstance(m, TernaryInferenceLinear))
+ternary_count = sum(
+    1 for m in model_loaded.modules() if isinstance(m, TernaryInferenceLinear)
+)
 print(f"  TernaryInferenceLinear layers: {ternary_count}")
 
 # ── Quick PPL test ───────────────────────────────────────────────────
@@ -198,13 +216,16 @@ TEXTS = [
     "Game theory is the study of mathematical models of strategic interaction among rational decision-makers. It has applications in economics, political science, psychology, computer science and biology. The Nash equilibrium is a fundamental concept in non-cooperative game theory.",
 ]
 
+
 def compute_ppl(model, tokenizer, texts, max_len=256):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
     with torch.no_grad():
         for text in texts[:8]:
-            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_len)
+            inputs = tokenizer(
+                text, return_tensors="pt", truncation=True, max_length=max_len
+            )
             input_ids = inputs["input_ids"]
             if has_cuda:
                 input_ids = input_ids.to(device)
@@ -213,7 +234,12 @@ def compute_ppl(model, tokenizer, texts, max_len=256):
             out = model(input_ids=input_ids, labels=input_ids)
             total_loss += out.loss.item() * (input_ids.numel() - 1)
             total_tokens += input_ids.numel() - 1
-    return math.exp(total_loss / max(total_tokens, 1)) if total_tokens > 0 else float('inf')
+    return (
+        math.exp(total_loss / max(total_tokens, 1))
+        if total_tokens > 0
+        else float("inf")
+    )
+
 
 ppl = compute_ppl(model_loaded, tokenizer, TEXTS)
 print(f"  PPL (diverse texts): {ppl:.2f}")
@@ -231,7 +257,9 @@ for prompt in PROMPTS:
         inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         out_ids = model_loaded.generate(
-            **inputs, max_new_tokens=30, do_sample=False,
+            **inputs,
+            max_new_tokens=30,
+            do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
     response_text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
