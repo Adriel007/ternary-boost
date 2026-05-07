@@ -112,11 +112,64 @@ def export_ternary_lora(
                 f"{skipped_count} unquantized layers")
 
     # ── Save ───────────────────────────────────────────────────────
-    # 1. Full model weights as standard safetensors (HF compatibility)
-    model_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
+    # 1. Full model weights as SHARDED safetensors (HF compatibility).
+    #    Building a single dict clones ALL GPU tensors to CPU at once
+    #    (~5.7 GB for Phi-2), causing CPU RAM OOM on Colab T4.
+    #    Sharded save iterates one tensor at a time in 800 MB chunks.
     from safetensors.torch import save_file
-    save_file(model_state, output_dir / "model.safetensors")
-    logger.info(f"  Saved model.safetensors ({len(model_state)} tensors)")
+    import gc
+
+    total_params = sum(p.numel() for p in model.parameters())
+    param_count = 0
+    target_bytes = int(0.8 * 1024**3)
+    weight_map = {}
+    shard_batch = {}
+    shard_bytes = 0
+    shard_idx = 0
+    shard_files = []
+
+    for key, param in model.named_parameters():
+        param_count += 1
+        tensor = param.detach().cpu()
+        nbytes = tensor.numel() * tensor.element_size()
+        shard_batch[key] = tensor
+        shard_bytes += nbytes
+
+        if shard_bytes >= target_bytes:
+            name = f"model-{shard_idx + 1:05d}-of-XXXXX.safetensors"
+            save_file(shard_batch, output_dir / name)
+            shard_files.append((name, list(shard_batch.keys())))
+            shard_batch.clear()
+            shard_bytes = 0
+            shard_idx += 1
+            gc.collect()
+
+    if shard_batch:
+        name = f"model-{shard_idx + 1:05d}-of-XXXXX.safetensors"
+        save_file(shard_batch, output_dir / name)
+        shard_files.append((name, list(shard_batch.keys())))
+        shard_idx += 1
+
+    # Fix XXXXX placeholder and build weight_map
+    total_shards = shard_idx
+    for old_name, keys in shard_files:
+        new_name = old_name.replace("XXXXX", f"{total_shards:05d}")
+        (output_dir / old_name).rename(output_dir / new_name)
+        for k in keys:
+            weight_map[k] = new_name
+
+    # Write HF-compatible index
+    index = {
+        "metadata": {"total_size": total_params * 2},
+        "weight_map": weight_map,
+    }
+    (output_dir / "model.safetensors.index.json").write_text(
+        json.dumps(index, indent=2))
+
+    del shard_batch, weight_map
+    gc.collect()
+    logger.info(
+        f"  Saved {total_shards} model shard(s) ({total_params:,} params)")
 
     # 2. Ternary params (INT2 packed + alphas)
     torch.save(ternary_params, output_dir / "ternary_params.pt")
