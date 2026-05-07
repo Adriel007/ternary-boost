@@ -190,7 +190,6 @@ def finetune_lora(
         for p in teacher_model.parameters():
             p.requires_grad = False
 
-        TEACHER_BATCH = 8  # texts per GPU forward
         n_texts = len(calibration_texts)
 
         # Right-padding is critical: the student processes texts one at a
@@ -199,25 +198,47 @@ def finetune_lora(
         _pad_side = tokenizer.padding_side
         tokenizer.padding_side = "right"
 
+        # Decide GPU vs CPU for teacher. GPU is ~10x faster but needs
+        # VRAM for teacher + batch activations. On T4 with Phi-2:
+        # student ~5.4 GB + teacher ~5.4 GB + batch ~1 GB = ~12 GB → OK.
+        # For 7B models (~13.5 GB each) we fall back to CPU automatically.
+        teacher_gpu = False
         if has_cuda:
+            vram_free = (torch.cuda.get_device_properties(0).total_memory
+                         - torch.cuda.memory_allocated()) / 1e9
+            teacher_gb = sum(p.numel() * p.element_size()
+                           for p in teacher_model.parameters()) / 1e9
+            # Batch of 8 at seq_len=128 needs ~1 GB for activations
+            if vram_free >= teacher_gb + 1.0:
+                teacher_gpu = True
+            else:
+                logger.warning(
+                    f"  Teacher too large for GPU (free={vram_free:.1f} GB, "
+                    f"need ~{teacher_gb + 1.0:.1f} GB). Using CPU.")
+
+        teach_batch = 8 if teacher_gpu else 1  # CPU: one at a time
+        if teacher_gpu:
             teacher_model.to(device)
             torch.cuda.empty_cache()
             logger.info("  Pre-computing teacher logits on GPU "
-                        f"(batch={TEACHER_BATCH}, {n_texts} texts)...")
+                        f"(batch={teach_batch}, {n_texts} texts)...")
         else:
+            teacher_model.cpu()
+            if has_cuda:
+                torch.cuda.empty_cache()
             logger.info("  Pre-computing teacher logits on CPU "
                         f"({n_texts} texts)...")
 
         with torch.no_grad():
-            for batch_start in range(0, n_texts, TEACHER_BATCH):
-                batch_end = min(batch_start + TEACHER_BATCH, n_texts)
+            for batch_start in range(0, n_texts, teach_batch):
+                batch_end = min(batch_start + teach_batch, n_texts)
                 batch_texts = calibration_texts[batch_start:batch_end]
 
                 inputs = tokenizer(
                     batch_texts, return_tensors="pt", truncation=True,
                     max_length=config.max_seq_length, padding=True,
                 )
-                if has_cuda:
+                if teacher_gpu:
                     inputs = {k: v.to(device) for k, v in inputs.items()}
 
                 out = teacher_model(input_ids=inputs["input_ids"])
