@@ -30,6 +30,7 @@ class PTBitNetConfig:
     block_size: int = 128
     # Quality improvements
     outlier_fraction: float = 0.01     # Top-k% weights kept in FP16 (SpQR)
+    use_obc: bool = False              # OBC row compensation (off for small models)
     compensation_steps: int = 50       # Hessian compensation on lm_head (GPTQ)
     # Legacy
     outlier_clip_threshold: float = 3.0
@@ -440,7 +441,8 @@ def apply_pt_bitnet(
 
             # ── OBC-style row compensation ──────────────────────
             # Activation-aware bias correction in output space.
-            if calib_in is not None:
+            # Gated behind use_obc: regresses PPL on small models (Phi-2).
+            if calib_in is not None and config.use_obc:
                 x_mean = calib_in.float().reshape(-1, calib_in.shape[-1]).mean(dim=0)
                 # Error in output space: use w_clean (GPU) not w (may be CPU)
                 error = ternary_w.float() - w_clean.float()  # [out_f, in_f]
@@ -461,16 +463,16 @@ def apply_pt_bitnet(
                 logger.info(f"  PT-BitNet: {i + 1}/{len(targets)} layers "
                             f"({100 * (i + 1) // len(targets)}%)")
 
-    logger.info(f"PT-BitNet complete: {len(targets)} layers quantized "
-                f"(with activation-aware row compensation)")
+    obc_tag = "with OBC" if config.use_obc else "no OBC"
+    logger.info(f"PT-BitNet complete: {len(targets)} layers quantized ({obc_tag})")
 
-    # Hessian compensation on lm_head: only when activation collection failed
-    # (no OBC). When OBC ran, every layer's bias was already compensated —
-    # additional lm_head training would double-correct and risk overfitting.
+    # Hessian compensation on lm_head: skipped when OBC ran (every layer's
+    # bias already compensated — additional lm_head training would double-correct).
     if (config.compensation_steps > 0 and tokenizer is not None
-            and calibration_texts is not None and not calibration_acts):
+            and calibration_texts is not None
+            and not (calibration_acts and config.use_obc)):
         hessian_compensation(model, tokenizer, calibration_texts, config)
-    elif calibration_acts:
+    elif calibration_acts and config.use_obc:
         logger.info("Hessian compensation skipped — OBC row compensation already applied")
 
     return model

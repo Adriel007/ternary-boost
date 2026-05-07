@@ -26,6 +26,7 @@ class ModelEntry:
     lambada_granularity: str = "per_channel"  # "per_channel" or "per_element"
     lora_rank: int = 32       # LoRA rank (0 = disable LoRA fine-tuning)
     lora_steps: int = 500     # LoRA optimization steps
+    merge_lora: bool = False  # Merge LoRA into weights? False = keep separate (compressed)
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}

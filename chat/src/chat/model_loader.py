@@ -567,15 +567,19 @@ def _compress_and_cache(
             # fine-tunes with student only. Peak VRAM: student alone (~6 GB).
             model = finetune_lora(model, tokenizer, texts_data[:50], teacher, lo_cfg)
 
-            # Merge LoRA into dense weights (no re-quantization).
-            # Re-ternarizing AFTER LoRA destroys quality: LoRA learns to
-            # COMPLEMENT the ternary pattern, not replace it. Forcing the
-            # correction into ternary structure breaks the complementary
-            # relationship. We keep dense weights — same size as bf16 ternary
-            # (5.6 GB) but with LoRA quality improvement baked in.
-            from pt_bitnet.lora import merge_lora_to_weights
-            model = merge_lora_to_weights(model)
-            logger.info("  LoRA merged into dense weights (no re-quantize)")
+            # LoRA storage policy:
+            #   merge_lora=True  → merge LoRA into dense weights (no re-quantize).
+            #                     W_dense = W_ternary + LoRA. 5.6 GB, PPL ~1.24x.
+            #   merge_lora=False → keep LoRA adapters separate from ternary
+            #                     weights. Enables INT2 export for 3.8x compression.
+            merge = getattr(entry, "merge_lora", False)
+            if merge:
+                from pt_bitnet.lora import merge_lora_to_weights
+                model = merge_lora_to_weights(model)
+                logger.info("  LoRA merged into dense weights (no re-quantize)")
+            else:
+                from pt_bitnet.lora import keep_lora_separate
+                model = keep_lora_separate(model)
             _save_model_state(model, tokenizer, cache_dir)
 
             elapsed = time.time() - t0

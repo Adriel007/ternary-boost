@@ -306,6 +306,25 @@ def _log_vram(label: str = "") -> None:
         )
 
 
+def keep_lora_separate(model: nn.Module) -> nn.Module:
+    """Keep LoRA adapters separate from ternary weights (no merge).
+
+    This preserves the ternary backbone as-is and saves LoRA as small
+    fp16 adapters. The model retains LoRALinear wrappers — forward()
+    computes y = W_ternary @ x + lora_scale * B @ (A @ x).
+
+    Use this when the goal is compressed inference (INT2 ternary + LoRA
+    stored separately), NOT when baking LoRA into dense weights.
+
+    Returns:
+        The model unchanged (LoRALinear wrappers intact).
+    """
+    count = sum(1 for m in model.modules()
+                if type(m).__name__ == "LoRALinear")
+    logger.info(f"  Kept {count} LoRA adapters separate (no merge)")
+    return model
+
+
 def merge_lora_to_weights(model: nn.Module) -> nn.Module:
     """Merge LoRA adapters back into the base weights (dense, non-ternary).
 
