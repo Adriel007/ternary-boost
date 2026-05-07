@@ -1,51 +1,55 @@
-# Ternary-Boost Pipeline Configuration
-# Hybrid LLM Compression: PT-BitNet + ParetoQ + ZeroQAT + Tequila
+# TernaryBoost Pipeline Configuration
+# Universal post-training ternarization (1.58-bit) + LoRA KD + INT2 export
 #
 # Usage:
-#   python run_pipeline.py --config configs/pipeline_config.yaml
+#   python scripts/colab_test.py --config configs/pipeline_config.yaml
 
 model:
-  name_or_path: "meta-llama/Llama-2-7b-hf"
-  dtype: "bfloat16"
+  name_or_path: "microsoft/phi-2"
+  dtype: "float16"
   device: "cuda"
 
 output:
   base_dir: "./output"
 
-stages:
+ternarization:
   pt_bitnet:
     enabled: true
     block_size: 128
-    clip_threshold: 3.0
+    outlier_fraction: 0.01
+    lm_head_hessian_steps: 30
+    asymmetric: false
 
-  paretoq_qat:
-    enabled: true
-    w_bits: 1
-    num_steps: 500
-    learning_rate: 1.0e-5
-    perturbation_scale: 1.0e-3
-    batch_size: 4
-    grad_clip: 1.0
+lora:
+  enabled: true
+  rank: 64
+  lora_alpha: 16
+  steps: 1000
+  distill_weight: 0.1
+  temperature: 1.5
+  learning_rate: 1.0e-4
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "fc1"
+    - "fc2"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
 
-  tequila:
-    enabled: true
-    quant_method: "ultraquantv3"
-    num_epochs: 1
-    range_of_lambada: 0.01
+export:
+  enabled: true
+  format: "int2_packed"
+  shard_size_mb: 800
 
 evaluation:
   enabled: true
   tasks:
-    - mmlu
-    - hellaswag
-    - arc_easy
-    - arc_challenge
-  batch_size: 16
-  compare_original: true
-
-export:
-  enabled: true
-  format: "bitnet_cpp"
+    - wikitext2
+    - c4_validation
+  max_len: 128
 
 logging:
   wandb:

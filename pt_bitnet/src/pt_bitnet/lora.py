@@ -12,6 +12,7 @@ with sufficient rank compensates.
 """
 
 import gc
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -59,6 +60,10 @@ class LoRAConfig:
     # Knowledge distillation
     distill_weight: float = 0.1   # CE dominates (0.9), KD gentle guide (0.1)
     temperature: float = 1.5      # Sharper targets (v1's T=3.0 was too soft)
+
+    # MiniLM attention distillation (BitDistill integration)
+    use_minilm: bool = False      # Q/K/V relation-matrix KD from last attention layer
+    minilm_weight: float = 0.05   # Small weight — logit KD + CE already dominate
 
 
 class LoRALinear(nn.Module):
@@ -144,6 +149,75 @@ def _add_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
     return model
 
 
+def _apiq_initialize_lora(
+    model: nn.Module,
+    teacher_model: Optional[PreTrainedModel],
+    calibration_texts: list[str],
+    tokenizer: PreTrainedTokenizer,
+    config: LoRAConfig,
+) -> None:
+    """Initialize LoRA A,B to minimize the quantization error via truncated SVD.
+
+    For each LoRA-wrapped layer, computes the error matrix E = W_fp16 - W_ternary
+    and initializes (B, A) from its optimal rank-r approximation:
+
+        E ≈ U_r @ Σ_r @ V_r^T
+        B = U_r @ sqrt(Σ_r),  A = sqrt(Σ_r) @ V_r^T
+
+    This is the "ApiQ-style" init (Liao et al., arXiv 2402.05147): LoRA starts
+    already compensating for most of the quantization gap, so the optimizer
+    only needs to refine rather than discover the correction from scratch.
+
+    When no teacher is available, falls back to random init (no-op).
+    """
+    if teacher_model is None:
+        logger.info("  ApiQ init skipped — no teacher model available")
+        return
+
+    teacher_layers = {}
+    for name, module in teacher_model.named_modules():
+        if isinstance(module, nn.Linear):
+            teacher_layers[name] = module
+
+    initialized = 0
+    for module_name, module in model.named_modules():
+        if not isinstance(module, LoRALinear):
+            continue
+        if module_name not in teacher_layers:
+            continue
+
+        try:
+            W_fp16 = teacher_layers[module_name].weight.data.float()
+            W_ternary = module.base.weight.data.float()
+            E = W_fp16 - W_ternary  # [out_f, in_f]
+
+            out_f, in_f = E.shape
+            q = min(config.rank + 8, min(out_f, in_f) - 1)
+            if q < 2:
+                continue
+
+            U, S, Vt = torch.svd_lowrank(E.cpu(), q=q)
+            r = min(config.rank, S.numel())
+            U = U[:, :r]              # [out_f, r]
+            S = S[:r]                  # [r]
+            Vt = Vt[:r, :]            # [r, in_f]
+
+            B_init = U * S.sqrt().unsqueeze(0)          # [out_f, r]
+            A_init = S.sqrt().unsqueeze(-1) * Vt         # [r, in_f]
+
+            device = module.lora_B.device
+            module.lora_B.data.copy_(B_init.to(device=device, dtype=module.lora_B.dtype))
+            module.lora_A.data.copy_(A_init.to(device=device, dtype=module.lora_A.dtype))
+            initialized += 1
+        except RuntimeError:
+            continue  # SVD can fail on degenerate layers — keep random init
+
+    if initialized > 0:
+        logger.info(f"  ApiQ init: {initialized} layers initialized from error SVD")
+    else:
+        logger.info("  ApiQ init: no layers matched — keeping random init")
+
+
 def _get_lora_params(model: nn.Module) -> list[nn.Parameter]:
     """Collect all LoRA trainable parameters."""
     params = []
@@ -151,6 +225,173 @@ def _get_lora_params(model: nn.Module) -> list[nn.Parameter]:
         if isinstance(m, LoRALinear):
             params.extend([m.lora_A, m.lora_B])
     return params
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MiniLM attention distillation (BitDistill, Wu et al. arXiv 2510.13998)
+# ═══════════════════════════════════════════════════════════════════
+
+def _find_last_attention_prefix(model: nn.Module) -> str | None:
+    """Find the FQN prefix of the last attention block (e.g. 'model.layers.31.self_attn')."""
+    candidates = []
+    for name, _ in model.named_modules():
+        if re.search(r"(?:self_attn|attention|attn)\.(?:q_proj|query)$", name):
+            # Normalize: strip the trailing .q_proj / .query
+            prefix = re.sub(r"\.(?:q_proj|query)$", "", name)
+            candidates.append(prefix)
+
+    if not candidates:
+        # Fallback: try any module with q_proj
+        for name, _ in model.named_modules():
+            if name.endswith(".q_proj"):
+                candidates.append(name.rsplit(".q_proj", 1)[0])
+    if not candidates:
+        return None
+
+    # Use the last (deepest) one — corresponds to final transformer layer
+    candidates.sort(key=lambda n: (n.count("."), n))
+    return candidates[-1]
+
+
+def minilm_attention_loss(
+    student_qkv: dict[str, torch.Tensor],
+    teacher_qkv: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Q/K/V relation-matrix distillation loss (MiniLM, Wang et al. 2020).
+
+    For each of Q, K, V:
+      R = matmul(proj, proj^T)   — relation matrix [batch, heads, seq, seq]
+      loss = KL( log_softmax(R_student), softmax(R_teacher) )
+
+    Args:
+        student_qkv: {'q': tensor, 'k': tensor, 'v': tensor} — shape [B, H, S, D]
+        teacher_qkv: same shape/dtype as student
+    Returns:
+        scalar loss (already reduced by batchmean)
+    """
+    losses = []
+    for proj in ('q', 'k', 'v'):
+        s = student_qkv[proj]  # [B, H, S, D]
+        t = teacher_qkv[proj]
+
+        s_flat = s.transpose(1, 2).reshape(-1, s.shape[2], s.shape[3])  # [B*H, S, D]
+        t_flat = t.transpose(1, 2).reshape(-1, t.shape[2], t.shape[3])
+
+        sR = torch.bmm(s_flat, s_flat.transpose(-1, -2))  # [B*H, S, S]
+        tR = torch.bmm(t_flat, t_flat.transpose(-1, -2))
+
+        losses.append(
+            F.kl_div(
+                F.log_softmax(sR, dim=-1),
+                F.softmax(tR, dim=-1),
+                reduction='batchmean',
+            )
+        )
+    return sum(losses) / len(losses)
+
+
+def _capture_teacher_qkv_relations(
+    teacher_model: PreTrainedModel,
+    tokenizer,
+    calibration_texts: list[str],
+    attn_prefix: str,
+    max_seq_length: int,
+    device: torch.device,
+) -> list[dict[str, torch.Tensor]] | None:
+    """Pre-compute teacher Q/K/V values from the last attention layer.
+
+    Returns a list (one per calibration text) of dicts with keys 'q', 'k', 'v'.
+    Each tensor is moved to the target device for fast access during training.
+    Returns None if the attention layer can't be hooked.
+    """
+    if attn_prefix is None:
+        return None
+
+    qkv_cache: list[dict[str, torch.Tensor]] = []
+    captured: dict[str, torch.Tensor | None] = {'q': None, 'k': None, 'v': None}
+
+    def _make_hook(key: str):
+        def _hook(module, _input, _output):
+            captured[key] = _output.detach()  # keep on teacher device
+        return _hook
+
+    hooks = []
+    try:
+        for proj in ('q', 'k', 'v'):
+            proj_name = f"{attn_prefix}.{proj}_proj"
+            mod = teacher_model.get_submodule(proj_name)
+            hooks.append(mod.register_forward_hook(_make_hook(proj)))
+    except (AttributeError, KeyError):
+        for h in hooks:
+            h.remove()
+        return None
+
+    teacher_device = next(teacher_model.parameters()).device
+    teacher_model.eval()
+
+    with torch.no_grad():
+        for text in calibration_texts:
+            inputs = tokenizer(text, return_tensors="pt", truncation=True,
+                               max_length=max_seq_length)
+            input_ids = inputs["input_ids"].to(teacher_device)
+
+            for k in captured:
+                captured[k] = None
+
+            try:
+                teacher_model(input_ids=input_ids)
+            except Exception:
+                continue
+
+            if any(v is None for v in captured.values()):
+                continue
+
+            qkv_cache.append({
+                k: v.to(device, non_blocking=False)
+                for k, v in captured.items()
+            })
+
+    for h in hooks:
+        h.remove()
+
+    if qkv_cache:
+        mb = sum(
+            sum(t.numel() * t.element_size() for t in d.values())
+            for d in qkv_cache
+        ) / 1e6
+        logger.info(f"  MiniLM: cached teacher Q/K/V for {len(qkv_cache)} samples ({mb:.0f} MB)")
+    else:
+        logger.warning("  MiniLM: failed to capture any teacher Q/K/V")
+
+    return qkv_cache if qkv_cache else None
+
+
+def _hook_student_qkv(
+    model: nn.Module, attn_prefix: str,
+) -> tuple[list, dict[str, torch.Tensor | None]]:
+    """Register forward hooks on student's last attention Q/K/V projections.
+
+    Returns (hook_handles, captured_dict) — caller must remove handles after use.
+    """
+    captured: dict[str, torch.Tensor | None] = {'q': None, 'k': None, 'v': None}
+
+    def _make_hook(key: str):
+        def _hook(_module, _input, _output):
+            captured[key] = _output.detach()
+        return _hook
+
+    hooks = []
+    try:
+        for proj in ('q', 'k', 'v'):
+            proj_name = f"{attn_prefix}.{proj}_proj"
+            mod = model.get_submodule(proj_name)
+            hooks.append(mod.register_forward_hook(_make_hook(proj)))
+    except (AttributeError, KeyError):
+        for h in hooks:
+            h.remove()
+        return [], captured
+
+    return hooks, captured
 
 
 def finetune_lora(
@@ -177,12 +418,28 @@ def finetune_lora(
 
     # ── Add LoRA adapters ────────────────────────────────────────
     model = _add_lora_to_model(model, config)
+
+    # ApiQ-style init: initialize LoRA from quantization error SVD
+    # (uses teacher weights, must happen before teacher is freed)
+    _apiq_initialize_lora(model, teacher_model, calibration_texts,
+                          tokenizer, config)
+
     model.train()
 
     lora_params = _get_lora_params(model)
     total_lora = sum(p.numel() for p in lora_params)
     logger.info(f"  LoRA trainable params: {total_lora:,} "
                 f"({total_lora * 4 / 1e6:.1f} MB fp32)")
+
+    # ── MiniLM setup: find last attention layer ──────────────────
+    attn_prefix = None
+    teacher_qkv_cache = None
+    if config.use_minilm and teacher_model is not None:
+        attn_prefix = _find_last_attention_prefix(model)
+        if attn_prefix is not None:
+            logger.info(f"  MiniLM: last attention layer = '{attn_prefix}'")
+        else:
+            logger.warning("  MiniLM: could not identify attention layer — disabled")
 
     # ── Phase 1: Pre-compute teacher logits (GPU batched) ────────
     # Teacher runs on GPU in batches of 8 for speed, logits cached
@@ -263,6 +520,13 @@ def finetune_lora(
 
         tokenizer.padding_side = _pad_side  # restore
 
+        # ── MiniLM: capture teacher Q/K/V from last attention layer ─
+        if attn_prefix is not None:
+            teacher_qkv_cache = _capture_teacher_qkv_relations(
+                teacher_model, tokenizer, calibration_texts,
+                attn_prefix, config.max_seq_length, device,
+            )
+
         # Free teacher from GPU/CPU
         del teacher_model
         gc.collect()
@@ -308,9 +572,30 @@ def finetune_lora(
         if input_ids.numel() < 2:
             continue
 
+        # ── MiniLM: hook student Q/K/V if teacher cache available for this index ─
+        student_qkv_hooks = []
+        student_qkv_captured = {'q': None, 'k': None, 'v': None}
+        use_minilm_this_step = (
+            teacher_qkv_cache is not None
+            and text_idx < len(teacher_qkv_cache)
+            and attn_prefix is not None
+        )
+        if use_minilm_this_step:
+            student_qkv_hooks, student_qkv_captured = _hook_student_qkv(
+                model, attn_prefix)
+
         # Student forward (ternary + LoRA) — only model on GPU
         student_out = model(input_ids=input_ids, labels=input_ids)
         ce_loss = student_out.loss
+
+        # ── MiniLM attention distillation loss ────────────────────
+        minilm_loss = torch.tensor(0.0, device=device)
+        if use_minilm_this_step and student_qkv_captured['q'] is not None:
+            teacher_qkv = teacher_qkv_cache[text_idx]
+            minilm_loss = minilm_attention_loss(student_qkv_captured, teacher_qkv)
+
+        for h in student_qkv_hooks:
+            h.remove()
 
         # KD using pre-cached teacher logits (already on GPU)
         distill_loss = torch.tensor(0.0, device=device)
@@ -326,9 +611,10 @@ def finetune_lora(
             distill_loss = F.kl_div(student_log_probs, teacher_probs,
                                     reduction="batchmean") * (T * T)
 
-        # Combined loss
+        # Combined loss: CE + logit KD + MiniLM attention KD
         beta = config.distill_weight if teacher_logits_cache else 0.0
-        loss = (1.0 - beta) * ce_loss + beta * distill_loss
+        gamma = config.minilm_weight if use_minilm_this_step else 0.0
+        loss = (1.0 - beta - gamma) * ce_loss + beta * distill_loss + gamma * minilm_loss
         loss = loss / config.gradient_accumulation
         loss.backward()
         del student_out

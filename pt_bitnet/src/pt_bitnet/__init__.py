@@ -12,6 +12,15 @@ from .quantize import (
 from .int2_packing import pack_int2, unpack_int2, verify_roundtrip
 from .ternary_linear import TernaryInferenceLinear, TernaryLoRAModel
 from .export import export_ternary_lora, load_ternary_lora
+from .subln import SubLN, insert_subln, remove_subln, count_subln
+from .hybrid_runtime import (
+    HybridTernaryLinear,
+    HybridModelConfig,
+    PyTorchTernaryKernel,
+    build_hybrid_layer,
+    load_hybrid_model,
+    benchmark_hybrid_layer,
+)
 
 __all__ = [
     "apply_pt_bitnet",
@@ -29,4 +38,14 @@ __all__ = [
     "TernaryLoRAModel",
     "export_ternary_lora",
     "load_ternary_lora",
+    "SubLN",
+    "insert_subln",
+    "remove_subln",
+    "count_subln",
+    "HybridTernaryLinear",
+    "HybridModelConfig",
+    "PyTorchTernaryKernel",
+    "build_hybrid_layer",
+    "load_hybrid_model",
+    "benchmark_hybrid_layer",
 ]

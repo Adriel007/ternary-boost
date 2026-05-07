@@ -31,6 +31,7 @@ class PTBitNetConfig:
     # Quality improvements
     outlier_fraction: float = 0.01     # Top-k% weights kept in FP16 (SpQR)
     use_obc: bool = False              # OBC row compensation (off for small models)
+    use_svid_scales: bool = False      # OneBit SVID rank-1 row×col outer product scales
     compensation_steps: int = 50       # Hessian compensation on lm_head (GPTQ)
     # Legacy
     outlier_clip_threshold: float = 3.0
@@ -49,14 +50,43 @@ class PTBitNetConfig:
 def _find_quantizable_linears(
     model: nn.Module, config: PTBitNetConfig
 ) -> list[tuple[str, nn.Linear]]:
+    """Discover quantizable linear layers via FQN regex auto-detection.
+
+    Uses architecture-agnostic regex patterns that match attention and FFN
+    projections across Phi-2, GPT-2, LLaMA, Mistral, Qwen, Pythia, Falcon,
+    and other common HF causal LM families.
+
+    Falls back to substring matching if no regex match for backward compat.
+    """
+    # Architecture-agnostic FQN regex patterns (torchao-style auto-discovery).
+    # These match the FULL module name (e.g. "model.layers.5.self_attn.q_proj").
+    import re
+    _ATTN_PROJ_RE = re.compile(
+        r".*(?:self_attn|attention|attn|mha)\.(?:q_proj|k_proj|v_proj|o_proj|dense|out_proj|query_key_value|c_attn)$"
+    )
+    _FFN_PROJ_RE = re.compile(
+        r".*(?:mlp|ffn)\.(?:gate_proj|up_proj|down_proj|fc1|fc2|dense_h_to_4h|dense_4h_to_h)$"
+    )
+
     targets = []
     for module_name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            if any(skip in module_name for skip in config.skip_modules):
-                continue
-            if any(t in module_name for t in config.target_modules):
-                targets.append((module_name, module))
-    logger.info(f"Found {len(targets)} quantizable linear layers")
+        if not isinstance(module, nn.Linear):
+            continue
+        # Skip embeddings and output head
+        if any(skip in module_name for skip in config.skip_modules):
+            continue
+
+        # Try regex first (architecture-agnostic), then substring fallback
+        matched = bool(_ATTN_PROJ_RE.match(module_name) or _FFN_PROJ_RE.match(module_name))
+        if not matched:
+            # Fallback: substring match for custom architectures
+            matched = any(t in module_name for t in config.target_modules)
+
+        if matched:
+            targets.append((module_name, module))
+
+    logger.info(f"Found {len(targets)} quantizable linear layers "
+                f"(regex auto-discovery + fallback)")
     return targets
 
 
@@ -400,6 +430,30 @@ def _symmetric_ternary(
             recon[torch.arange(out_f, device=w.device), batch_idx],
             best_result,
         )
+
+    # ── OneBit SVID rank-1 scales ──────────────────────────────
+    # Decompose |W| ≈ σ₁ · u₁ · v₁ᵀ, then use u₁ and v₁ as row×col
+    # scale factors applied to the ternary mask. This replaces the
+    # per-row-only scalar α_i with a rank-1 outer product α_row[i] · β_col[j],
+    # capturing column-wise variation that a single per-row scalar misses.
+    # Reference: Xu et al., "OneBit," arXiv 2402.11295, Feb 2024.
+    if getattr(config, 'use_svid_scales', False) and out_f > 1 and in_f > 1:
+        try:
+            U, S, Vt = torch.linalg.svd(w_abs.float(), full_matrices=False)
+            sigma1 = S[0].clamp_min(1e-8)
+            u1 = U[:, 0]                  # [out_f] — row-wise importance
+            v1 = Vt[0, :]                 # [in_f] — column-wise importance
+
+            beta_col = (v1.abs() * torch.sqrt(sigma1)).to(device=w.device, dtype=w.dtype)
+            beta_col = beta_col / beta_col.mean().clamp_min(1e-8)
+
+            alpha_row = (u1.abs() * torch.sqrt(sigma1)).to(device=w.device, dtype=w.dtype)
+            alpha_row = alpha_row / alpha_row.mean().clamp_min(1e-8)
+
+            sign_pattern = best_result.sign()  # {-1, 0, +1}
+            best_result = alpha_row.unsqueeze(-1) * beta_col.unsqueeze(0) * sign_pattern
+        except RuntimeError:
+            pass  # SVD can fail on degenerate inputs — keep per-row alpha
 
     return best_result
 
