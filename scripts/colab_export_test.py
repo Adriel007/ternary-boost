@@ -24,6 +24,7 @@ ENABLE_LORA = True  # True = testa export COM LoRA (~50 min)
 LORA_RANK = 64
 LORA_STEPS = 1000
 EXPORT_DIR = "/content/exported_phi2"
+CKPT_DIR = f"/content/export_checkpoints/{MODEL.replace('/', '__')}"
 # ═══════════════════════════════════════════════════════════════════════
 
 ROOT = os.getcwd()
@@ -55,10 +56,90 @@ from shared.data import load_calibration_texts
 
 torch.manual_seed(42)
 
+# ═══════════════════════════════════════════════════════════════════════
+# Checkpoint helpers — allow resume after crash without re-running
+# ═══════════════════════════════════════════════════════════════════════
+from pathlib import Path as _Path
+
+
+def _ckpt_path(stage):
+    return _Path(CKPT_DIR) / stage
+
+
+def _has_ckpt(stage):
+    return (_ckpt_path(stage) / "done.txt").exists()
+
+
+def _save_ckpt(model, tokenizer, stage):
+    """Save model + tokenizer as sharded safetensors checkpoint."""
+    from chat.model_loader import _save_model_state
+    p = _ckpt_path(stage)
+    p.mkdir(parents=True, exist_ok=True)
+    _save_model_state(model, tokenizer, p)
+    (p / "done.txt").write_text("ok")
+    print(f"  [checkpoint] Saved {stage}")
+
+
+def _load_ckpt(stage, device, dtype):
+    """Load model + tokenizer from checkpoint."""
+    p = _ckpt_path(stage)
+    config = AutoConfig.from_pretrained(str(p), trust_remote_code=True)
+    if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
+        config.pad_token_id = 0
+    model = AutoModelForCausalLM.from_pretrained(
+        str(p), torch_dtype=dtype, device_map=device,
+        trust_remote_code=True, config=config,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(str(p), trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    n = sum(p.numel() for p in model.parameters())
+    print(f"  [checkpoint] Loaded {stage} ({n:,} params)")
+    return model, tokenizer
+
+
+def _save_lora_ckpt(model, stage):
+    """Save LoRA weights + config (lightweight, reuses stage2 base model)."""
+    from pt_bitnet.lora import save_lora_weights
+    p = _ckpt_path(stage)
+    p.mkdir(parents=True, exist_ok=True)
+    save_lora_weights(model, str(p / "lora_weights.safetensors"))
+    (p / "lora_config.json").write_text(json.dumps({
+        "rank": LORA_RANK, "steps": LORA_STEPS,
+    }))
+    (p / "done.txt").write_text("ok")
+    print(f"  [checkpoint] Saved {stage} (LoRA weights only)")
+
+
+def _load_lora_ckpt(model, stage):
+    """Load LoRA weights onto a model that already has LoRA wrappers."""
+    from pt_bitnet.lora import load_lora_weights
+    p = _ckpt_path(stage)
+    # Validate saved config matches current — warn if mismatch
+    cfg_path = p / "lora_config.json"
+    if cfg_path.exists():
+        saved = json.loads(cfg_path.read_text())
+        if saved.get("rank") != LORA_RANK or saved.get("steps") != LORA_STEPS:
+            print(f"  [!] LoRA config changed (saved rank={saved.get('rank')} "
+                  f"vs current={LORA_RANK}). Delete {p} to re-train.")
+    lora_path = str(p / "lora_weights.safetensors")
+    if _Path(lora_path).exists():
+        load_lora_weights(model, lora_path)
+        print(f"  [checkpoint] Loaded LoRA weights from {stage}")
+    return model
+
+
+# ═══════════════════════════════════════════════════════════════════════
+
+resumed_stages = []
+
 print("=" * 60)
 print("TernaryBoost Export Pipeline Test")
 print(f"Model: {MODEL}  |  LoRA: {'ON' if ENABLE_LORA else 'OFF'}")
 print(f"Export dir: {EXPORT_DIR}")
+print(f"Checkpoints: {CKPT_DIR}")
+if any(_has_ckpt(s) for s in ["stage1_base", "stage2_pt_bitnet", "stage3_lora"]):
+    print("Resume: YES — skipping completed stages")
 print("=" * 60)
 
 # ── Step 0: INT2 packing sanity check (local, 1s) ────────────────────
@@ -81,21 +162,26 @@ has_cuda = torch.cuda.is_available()
 device = "cuda" if has_cuda else "cpu"
 dtype = torch.bfloat16 if has_cuda else torch.float32
 
-config = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
-if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
-    config.pad_token_id = 0
+if _has_ckpt("stage1_base"):
+    model, tokenizer = _load_ckpt("stage1_base", "cpu", dtype)
+    resumed_stages.append("base")
+else:
+    config = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
+    if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
+        config.pad_token_id = 0
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL,
-    torch_dtype=dtype,
-    low_cpu_mem_usage=True,
-    device_map="cpu",
-    trust_remote_code=True,
-    config=config,
-)
-tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+        device_map="cpu",
+        trust_remote_code=True,
+        config=config,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    _save_ckpt(model, tokenizer, "stage1_base")
 
 n_params = sum(p.numel() for p in model.parameters())
 print(f"  Loaded {n_params:,} params in {time.time()-t0:.1f}s")
@@ -106,18 +192,28 @@ t0 = time.time()
 
 texts = load_calibration_texts(source="wikitext", num_samples=200)
 
-pt_config = PTBitNetConfig(
-    asymmetric=False,
-    outlier_fraction=0.01,
-    compensation_steps=50 if has_cuda else 10,
-    use_obc=False,  # desligado para modelos pequenos
-)
+if _has_ckpt("stage2_pt_bitnet"):
+    del model; gc.collect()
+    if has_cuda:
+        torch.cuda.empty_cache()
+    model, tokenizer = _load_ckpt("stage2_pt_bitnet", device, dtype)
+    resumed_stages.append("pt_bitnet")
+else:
+    pt_config = PTBitNetConfig(
+        asymmetric=False,
+        outlier_fraction=0.01,
+        compensation_steps=30 if has_cuda else 10,
+        use_obc=False,
+    )
 
-if has_cuda:
-    model.cuda()
-    torch.cuda.empty_cache()
+    if has_cuda:
+        model.cuda()
+        torch.cuda.empty_cache()
 
-model = apply_pt_bitnet(model, pt_config, tokenizer, texts[:32])
+    model = apply_pt_bitnet(model, pt_config, tokenizer, texts[:32])
+    if has_cuda:
+        _save_ckpt(model, tokenizer, "stage2_pt_bitnet")
+
 elapsed_pt = time.time() - t0
 print(f"  PT-BitNet done in {elapsed_pt:.1f}s")
 
@@ -127,37 +223,46 @@ if ENABLE_LORA:
     print(f"\n[3/5] LoRA fine-tuning (rank={LORA_RANK}, steps={LORA_STEPS})...")
     t0 = time.time()
 
-    from pt_bitnet.lora import finetune_lora, keep_lora_separate, LoRAConfig
+    from pt_bitnet.lora import (
+        finetune_lora, keep_lora_separate, LoRAConfig,
+        _add_lora_to_model,
+    )
 
     if has_cuda:
         model.cuda()
         torch.cuda.empty_cache()
         import gc as _gc
-
         _gc.collect()
 
-    teacher_config = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
-    if not hasattr(teacher_config, "pad_token_id") or teacher_config.pad_token_id is None:
-        teacher_config.pad_token_id = 0
-    teacher = AutoModelForCausalLM.from_pretrained(
-        MODEL,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        device_map="cpu",
-        trust_remote_code=True,
-        config=teacher_config,
-    )
+    if _has_ckpt("stage3_lora"):
+        # Resume: base model loaded from stage2, just re-wrap with LoRA + load weights
+        lo_cfg = LoRAConfig(rank=LORA_RANK, num_steps=LORA_STEPS)
+        model = _add_lora_to_model(model, lo_cfg)
+        model = _load_lora_ckpt(model, "stage3_lora")
+        model = keep_lora_separate(model)
+        resumed_stages.append("lora")
+    else:
+        teacher_config = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
+        if not hasattr(teacher_config, "pad_token_id") or teacher_config.pad_token_id is None:
+            teacher_config.pad_token_id = 0
+        teacher = AutoModelForCausalLM.from_pretrained(
+            MODEL,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            device_map="cpu",
+            trust_remote_code=True,
+            config=teacher_config,
+        )
 
-    lo_cfg = LoRAConfig(rank=LORA_RANK, num_steps=LORA_STEPS)
-    model = finetune_lora(model, tokenizer, texts[:50], teacher, lo_cfg)
+        lo_cfg = LoRAConfig(rank=LORA_RANK, num_steps=LORA_STEPS)
+        model = finetune_lora(model, tokenizer, texts[:50], teacher, lo_cfg)
 
-    # Free teacher from CPU RAM (5.4 GB) — no longer needed
-    del teacher
-    import gc as _gc2
-    _gc2.collect()
+        del teacher
+        import gc as _gc2
+        _gc2.collect()
 
-    # keep separate — NÃO faz merge
-    model = keep_lora_separate(model)
+        model = keep_lora_separate(model)
+        _save_lora_ckpt(model, "stage3_lora")
 
     lora_elapsed = time.time() - t0
     print(f"  LoRA done in {lora_elapsed:.1f}s")
@@ -322,4 +427,6 @@ print(f"  LoRA separate:      {'yes' if ENABLE_LORA else 'n/a'}")
 
 total_time = (elapsed_pt + lora_elapsed + export_elapsed + load_elapsed) / 60
 print(f"\n  Total runtime: {total_time:.1f} min")
+if resumed_stages:
+    print(f"  Resumed stages: {', '.join(resumed_stages)}")
 print("=" * 60)

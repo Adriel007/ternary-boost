@@ -346,10 +346,11 @@ def _symmetric_ternary(
     """Symmetric ternary fallback: {-α, 0, +α}.
 
     If col_weights is provided (e.g., Hessian diagonal), the error
-    computation weights each column by its activation importance:
-      error = Σ_j h_j * (w_ij - w_q_ij)^2
-    This is the activation-aware variant — channels with higher activations
-    get finer quantization.
+    computation weights each column by its activation importance.
+
+    Candidates are evaluated in batches of 16 to amortize CUDA kernel
+    launch overhead (256 launches → 16) while keeping peak 3D tensor
+    memory ≤ 400 MB per large intermediate for typical layer sizes.
     """
     out_f, in_f = w.shape
     w_abs = w.abs()
@@ -362,24 +363,43 @@ def _symmetric_ternary(
     n_candidates = min(in_f, 256)
     step = max(1, in_f // n_candidates)
     candidate_indices = torch.arange(0, in_f, step, device=w.device)
-    candidate_deltas = w_abs_sorted[:, candidate_indices]
+    candidate_deltas = w_abs_sorted[:, candidate_indices]  # [out_f, n_cand]
 
     best_error = torch.full((out_f,), float("inf"), device=w.device)
     best_result = torch.zeros_like(w)
-    cw = col_weights.unsqueeze(0)  # [1, in_f] for broadcasting
+    cw = col_weights.unsqueeze(0)  # [1, in_f]
 
-    for j in range(candidate_indices.size(0)):
-        delta = candidate_deltas[:, j:j+1]
-        active = w_abs >= delta
-        active_count = active.sum(dim=-1).clamp_min(1)
-        alpha = (w_abs * active.float()).sum(dim=-1) / active_count
-        recon = torch.where(active, alpha.unsqueeze(-1) * w_sign, torch.zeros_like(w))
-        # Weighted error: columns with higher activations contribute more
-        sq_error = ((w - recon) ** 2) * cw
-        error = sq_error.sum(dim=-1)
-        improve = error < best_error
-        best_error = torch.where(improve, error, best_error)
-        best_result = torch.where(improve.unsqueeze(-1), recon, best_result)
+    B = 16  # batch size: balance VRAM vs kernel launch count
+    n_cand = candidate_indices.size(0)
+
+    for batch_start in range(0, n_cand, B):
+        batch_end = min(batch_start + B, n_cand)
+        deltas = candidate_deltas[:, batch_start:batch_end]  # [out_f, b]
+
+        # Evaluate all candidates in this batch simultaneously
+        # active[b, i, j]: weight[i,j] keeps sign at threshold delta[b,i]
+        active = w_abs.unsqueeze(1) >= deltas.unsqueeze(-1)   # [out_f, b, in_f]
+        active_count = active.sum(dim=-1).clamp_min(1)        # [out_f, b]
+        alpha = (w_abs.unsqueeze(1) * active.float()).sum(dim=-1) / active_count  # [out_f, b]
+
+        recon = torch.where(
+            active,
+            alpha.unsqueeze(-1) * w_sign.unsqueeze(1),
+            torch.tensor(0.0, device=w.device),
+        )  # [out_f, b, in_f]
+
+        # Weighted error per candidate — reduce over in_f immediately
+        error = ((w.unsqueeze(1) - recon) ** 2 * cw).sum(dim=-1)  # [out_f, b]
+
+        # Best candidate within this batch, then merge with global best
+        batch_best, batch_idx = error.min(dim=1)  # [out_f], [out_f]
+        improve = batch_best < best_error
+        best_error = torch.where(improve, batch_best, best_error)
+        best_result = torch.where(
+            improve.unsqueeze(-1),
+            recon[torch.arange(out_f, device=w.device), batch_idx],
+            best_result,
+        )
 
     return best_result
 

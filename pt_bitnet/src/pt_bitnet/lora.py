@@ -217,6 +217,16 @@ def finetune_lora(
 
         logger.info(f"  Cached {len(teacher_logits_cache)} teacher logits "
                     f"({cache_mb:.0f} MB CPU RAM)")
+
+        # Pre-move all cached logits to GPU in one batch.
+        # Avoids 1000 individual CPU→GPU transfers in the training loop
+        # (synchronous .to(device) per step adds ~50-80s of CUDA sync overhead).
+        if has_cuda:
+            teacher_logits_cache = [t.to(device, non_blocking=False)
+                                    for t in teacher_logits_cache]
+            gpu_mb = sum(t.numel() * t.element_size()
+                        for t in teacher_logits_cache) / 1e6
+            logger.info(f"  Moved teacher logits to GPU ({gpu_mb:.0f} MB)")
     else:
         logger.info("  No teacher — using CE loss only (no distillation)")
 
@@ -246,10 +256,10 @@ def finetune_lora(
         student_out = model(input_ids=input_ids, labels=input_ids)
         ce_loss = student_out.loss
 
-        # KD using pre-cached teacher logits (on CPU)
+        # KD using pre-cached teacher logits (already on GPU)
         distill_loss = torch.tensor(0.0, device=device)
         if teacher_logits_cache:
-            cached_logits = teacher_logits_cache[text_idx].to(device)
+            cached_logits = teacher_logits_cache[text_idx]  # already on GPU
             # Align sequence lengths (cached might be longer than student)
             min_len = min(student_out.logits.shape[1], cached_logits.shape[1])
             T = config.temperature
@@ -259,7 +269,6 @@ def finetune_lora(
                 cached_logits[:, :min_len, :] / T, dim=-1)
             distill_loss = F.kl_div(student_log_probs, teacher_probs,
                                     reduction="batchmean") * (T * T)
-            del cached_logits  # Free GPU copy
 
         # Combined loss
         beta = config.distill_weight if teacher_logits_cache else 0.0
