@@ -459,7 +459,7 @@ def apply_pt_bitnet(
             module.weight = nn.Parameter(ternary_w)
             module.weight.requires_grad = False
 
-            if config.show_progress and (i + 1) % max(1, len(targets) // 10) == 0:
+            if config.show_progress and (i + 1) % max(1, len(targets) // 20) == 0:
                 logger.info(f"  PT-BitNet: {i + 1}/{len(targets)} layers "
                             f"({100 * (i + 1) // len(targets)}%)")
 

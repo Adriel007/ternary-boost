@@ -128,6 +128,9 @@ def export_ternary_lora(
     shard_idx = 0
     shard_files = []
 
+    logger.info(f"  Saving model weights ({total_params:,} params, "
+                f"est. ~{total_params * 2 / 1e9:.1f} GB)...")
+
     for key, param in model.named_parameters():
         param_count += 1
         tensor = param.detach().cpu()
@@ -136,19 +139,23 @@ def export_ternary_lora(
         shard_bytes += nbytes
 
         if shard_bytes >= target_bytes:
-            name = f"model-{shard_idx + 1:05d}-of-XXXXX.safetensors"
+            shard_idx += 1
+            name = f"model-{shard_idx:05d}-of-XXXXX.safetensors"
+            logger.info(f"  Saving shard {shard_idx}... "
+                        f"({len(shard_batch)} tensors, {shard_bytes/1e6:.0f} MB)")
             save_file(shard_batch, output_dir / name)
             shard_files.append((name, list(shard_batch.keys())))
             shard_batch.clear()
             shard_bytes = 0
-            shard_idx += 1
             gc.collect()
 
     if shard_batch:
-        name = f"model-{shard_idx + 1:05d}-of-XXXXX.safetensors"
+        shard_idx += 1
+        name = f"model-{shard_idx:05d}-of-XXXXX.safetensors"
+        logger.info(f"  Saving shard {shard_idx} (final)... "
+                    f"({len(shard_batch)} tensors, {shard_bytes/1e6:.0f} MB)")
         save_file(shard_batch, output_dir / name)
         shard_files.append((name, list(shard_batch.keys())))
-        shard_idx += 1
 
     # Fix XXXXX placeholder and build weight_map
     total_shards = shard_idx

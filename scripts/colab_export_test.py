@@ -151,6 +151,11 @@ if ENABLE_LORA:
     lo_cfg = LoRAConfig(rank=LORA_RANK, num_steps=LORA_STEPS)
     model = finetune_lora(model, tokenizer, texts[:50], teacher, lo_cfg)
 
+    # Free teacher from CPU RAM (5.4 GB) — no longer needed
+    del teacher
+    import gc as _gc2
+    _gc2.collect()
+
     # keep separate — NÃO faz merge
     model = keep_lora_separate(model)
 
@@ -226,7 +231,8 @@ def compute_ppl(model, tokenizer, texts, max_len=256):
     total_loss = 0.0
     total_tokens = 0
     with torch.no_grad():
-        for text in texts[:8]:
+        for i, text in enumerate(texts[:8]):
+            print(f"  Text {i+1}/8...", end=" ", flush=True)
             inputs = tokenizer(
                 text, return_tensors="pt", truncation=True, max_length=max_len
             )
@@ -255,7 +261,7 @@ PROMPTS = [
     "Water freezes at",
     "The largest planet in the solar system is",
 ]
-for prompt in PROMPTS:
+for pi, prompt in enumerate(PROMPTS):
     inputs = tokenizer(prompt, return_tensors="pt")
     if has_cuda:
         inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -275,8 +281,14 @@ print("\n─ INT2 roundtrip integrity ─")
 # by checking a sample of ternary layers
 total_weights = 0
 max_error = 0.0
+checked = 0
+total_ternary = sum(1 for m in model_loaded.modules()
+                    if isinstance(m, TernaryInferenceLinear))
 for name, module in model_loaded.named_modules():
     if isinstance(module, TernaryInferenceLinear):
+        checked += 1
+        if checked % 20 == 0 or checked == total_ternary:
+            print(f"  INT2 check {checked}/{total_ternary} layers...", flush=True)
         T = unpack_int2(module.int2_packed, module.in_features)
         # All values must be in {-1, 0, 1}
         invalid = (T != -1) & (T != 0) & (T != 1)
