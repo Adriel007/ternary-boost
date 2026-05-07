@@ -37,8 +37,9 @@ logger = get_logger("pt_bitnet.export")
 _SKIP_MODULES = ("lm_head", "embed_tokens")
 
 # Target modules for ternary quantization
-_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj",
-                   "gate_proj", "up_proj", "down_proj")
+_TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "dense",
+                   "gate_proj", "up_proj", "down_proj",
+                   "fc1", "fc2")
 
 
 def export_ternary_lora(

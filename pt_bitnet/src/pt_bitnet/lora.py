@@ -40,8 +40,12 @@ class LoRAConfig:
     alpha: float = 128.0          # Scaling factor (alpha=2*rank is standard)
     dropout: float = 0.0          # No dropout — teacher already regularizes
     target_modules: tuple = (
-        "q_proj", "k_proj", "v_proj", "o_proj",  # Attention only — FFN doesn't
-                                                   # benefit as much from LoRA
+        # Attention (all families)
+        "q_proj", "k_proj", "v_proj", "o_proj", "dense",
+        # FFN — LLaMA/Mistral family
+        "gate_proj", "up_proj", "down_proj",
+        # FFN — Phi/GPT-2 family
+        "fc1", "fc2",
     )
     skip_modules: tuple = ("lm_head", "embed_tokens")
 
