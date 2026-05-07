@@ -491,30 +491,71 @@ def apply_pt_bitnet(
     model.eval()
     targets = _find_quantizable_linears(model, config)
 
+    # ── VRAM safety check ────────────────────────────────────────
+    if torch.cuda.is_available():
+        free_gb = (torch.cuda.get_device_properties(0).total_memory
+                   - torch.cuda.memory_allocated()) / 1e9
+        # Largest Phi-2 layer (fc2) needs ~2 GB temp with adaptive B.
+        # Require at least 3 GB headroom.
+        if free_gb < 3.0:
+            logger.warning(
+                f"  ⚠ Only {free_gb:.1f} GB VRAM free — quantization needs ~3 GB. "
+                f"Make sure only the student model is on GPU. "
+                f"If a teacher model is also loaded, move it to CPU first: "
+                f"teacher.cpu(); torch.cuda.empty_cache()"
+            )
+            # Attempt CPU fallback for the largest layers
+            if free_gb < 1.0:
+                logger.error(
+                    f"  ❌ VRAM critically low ({free_gb:.1f} GB free). "
+                    f"Cannot quantize on GPU. Move model to CPU or free VRAM."
+                )
+                raise RuntimeError(
+                    f"Not enough VRAM for quantization: {free_gb:.1f} GB free, "
+                    f"need ≥ 3 GB. Free teacher/other models from GPU."
+                )
+
     # Prepare calibration activations for AGA (if possible)
     calibration_acts = _collect_activations(model, tokenizer, calibration_texts, config)
+
+    has_cuda = torch.cuda.is_available()
 
     with torch.no_grad():
         for i, (name, module) in enumerate(targets):
             w = module.weight.data
             device = w.device
 
-            # Move to GPU for speed if available
-            w_clean = w.cuda() if torch.cuda.is_available() else w
-
-            # Get calibration inputs for this layer (for AGA / OBC compensation)
+            # Get calibration inputs for this layer
             calib_in = calibration_acts.get(name) if calibration_acts else None
-            if calib_in is not None and torch.cuda.is_available():
+            if calib_in is not None and has_cuda:
                 calib_in = calib_in.cuda()
 
-            # Normalize before quantization
-            w_mean = w_clean.mean(dim=-1, keepdim=True)
-            w_std = w_clean.std(dim=-1, keepdim=True).clamp_min(1e-8)
-            w_norm = (w_clean - w_mean) / w_std
-            w_norm = w_norm.clamp(-config.outlier_clip_threshold, config.outlier_clip_threshold)
+            # Normalize
+            w_mean = w.mean(dim=-1, keepdim=True)
+            w_std = w.std(dim=-1, keepdim=True).clamp_min(1e-8)
+            w_norm = (w - w_mean) / w_std
+            w_norm_clipped = w_norm.clamp(-config.outlier_clip_threshold, config.outlier_clip_threshold)
 
-            # PT²-LLM quantization
-            ternary_w_norm = ternary_quantize_vectorized(w_norm, config, calib_in)
+            # Quantize: try GPU first, fall back to CPU if OOM
+            ternary_w_norm = None
+            if has_cuda and device.type == "cuda":
+                try:
+                    ternary_w_norm = ternary_quantize_vectorized(
+                        w_norm_clipped.cuda(), config, calib_in)
+                except torch.cuda.OutOfMemoryError:
+                    logger.warning(
+                        f"  GPU OOM on layer '{name}' — "
+                        f"falling back to CPU quantization for this layer"
+                    )
+                    torch.cuda.empty_cache()
+                    ternary_w_norm = ternary_quantize_vectorized(
+                        w_norm_clipped.cpu(), config,
+                        calib_in.cpu() if calib_in is not None else None,
+                    )
+                    ternary_w_norm = ternary_w_norm.to(device)
+            else:
+                ternary_w_norm = ternary_quantize_vectorized(
+                    w_norm_clipped, config, calib_in)
 
             # Denormalize
             ternary_w = ternary_w_norm * w_std + w_mean
@@ -524,8 +565,8 @@ def apply_pt_bitnet(
             # Gated behind use_obc: regresses PPL on small models (Phi-2).
             if calib_in is not None and config.use_obc:
                 x_mean = calib_in.float().reshape(-1, calib_in.shape[-1]).mean(dim=0)
-                # Error in output space: use w_clean (GPU) not w (may be CPU)
-                error = ternary_w.float() - w_clean.float()  # [out_f, in_f]
+                # Error in output space relative to original FP16 weight
+                error = ternary_w.float() - w.float()  # [out_f, in_f]
                 bias_comp = -(error @ x_mean)                 # [out_f]
                 if module.bias is not None:
                     module.bias.data.add_(
