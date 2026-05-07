@@ -25,7 +25,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from torch.utils.data import DataLoader
 
 from shared.logging import get_logger, MetricsTracker, log_memory_usage
@@ -155,11 +155,15 @@ class TernaryBoostPipeline:
         logger.info("=" * 60)
 
         logger.info("Loading base model...")
+        cfg = AutoConfig.from_pretrained(self.args.model, trust_remote_code=True)
+        if not hasattr(cfg, "pad_token_id") or cfg.pad_token_id is None:
+            cfg.pad_token_id = 0
         model = AutoModelForCausalLM.from_pretrained(
             self.args.model,
             torch_dtype=self.dtype,
             low_cpu_mem_usage=True,
             device_map="cpu",
+            config=cfg,
         )
         tokenizer = AutoTokenizer.from_pretrained(self.args.model)
         if tokenizer.pad_token is None:
