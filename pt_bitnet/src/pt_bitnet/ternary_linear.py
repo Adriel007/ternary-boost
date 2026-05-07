@@ -102,24 +102,26 @@ class TernaryInferenceLinear(nn.Module):
         """
         # 1. Ternary backbone
         T = unpack_int2(self.int2_packed, self.in_features).to(dtype=x.dtype)
+        alpha = self.alpha.to(dtype=x.dtype)
         # W = alpha * T + mu  (not materialized — fused into matmul)
-        # y_tern = alpha * (T @ x) + mu * sum_j(x_j)
-        ternary_out = F.linear(x, T)                # [*, out_f]
-        ternary_out = ternary_out * self.alpha.squeeze(-1)  # [*, out_f] * [out_f]
+        ternary_out = F.linear(x, T)                     # [*, out_f]
+        ternary_out = ternary_out * alpha.squeeze(-1)    # [*, out_f] * [out_f]
         if self._asymmetric:
-            ternary_out = ternary_out + self.mu.squeeze(-1) * x.sum(dim=-1, keepdim=True)
+            mu = self.mu.to(dtype=x.dtype)
+            ternary_out = ternary_out + mu.squeeze(-1) * x.sum(dim=-1, keepdim=True)
 
         # 2. LoRA correction
         if self.has_lora:
             lora_A = self.lora_A.to(dtype=x.dtype)
             lora_B = self.lora_B.to(dtype=x.dtype)
-            lora_out = F.linear(x, lora_A)          # [*, rank]
-            lora_out = F.linear(lora_out, lora_B)    # [*, out_f]
+            lora_out = F.linear(x, lora_A)               # [*, rank]
+            lora_out = F.linear(lora_out, lora_B)         # [*, out_f]
             ternary_out = ternary_out + self.lora_scale * lora_out
 
         # 3. Bias
         if self.bias is not None:
-            ternary_out = ternary_out + self.bias
+            bias = self.bias.to(dtype=x.dtype)
+            ternary_out = ternary_out + bias
 
         return ternary_out
 
