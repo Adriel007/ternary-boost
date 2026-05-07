@@ -136,12 +136,16 @@ if ENABLE_LORA:
 
         _gc.collect()
 
+    teacher_config = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
+    if not hasattr(teacher_config, "pad_token_id") or teacher_config.pad_token_id is None:
+        teacher_config.pad_token_id = 0
     teacher = AutoModelForCausalLM.from_pretrained(
         MODEL,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
         device_map="cpu",
         trust_remote_code=True,
+        config=teacher_config,
     )
 
     lo_cfg = LoRAConfig(rank=LORA_RANK, num_steps=LORA_STEPS)
