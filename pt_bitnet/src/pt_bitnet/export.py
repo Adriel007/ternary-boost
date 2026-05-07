@@ -71,6 +71,10 @@ def export_ternary_lora(
     skipped_count = 0
 
     for module_name, module in model.named_modules():
+        # Skip children of LoRALinear — already handled by their parent
+        if ".base" in module_name.split("."):
+            continue
+
         # Skip modules
         if any(s in module_name for s in skip_modules):
             if isinstance(module, nn.Linear):
@@ -152,28 +156,40 @@ def load_ternary_lora(
 
     # 1. Load config
     config = AutoConfig.from_pretrained(str(path), trust_remote_code=trust_remote_code)
+    if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
+        config.pad_token_id = 0
 
-    # 2. Create skeleton model (random weights)
-    logger.info("Creating model skeleton...")
-    with torch.device("meta" if device == "cpu" else device):
-        model = AutoModelForCausalLM.from_config(
-            config, torch_dtype=torch_dtype, trust_remote_code=trust_remote_code,
-        )
-
-    # Instantiate with real tensors
-    model = AutoModelForCausalLM.from_pretrained(
-        str(path), torch_dtype=torch_dtype, device_map=device,
-        trust_remote_code=trust_remote_code,
+    # 2. Create model skeleton from config (random init, right structure)
+    logger.info("Creating model skeleton from config...")
+    model = AutoModelForCausalLM.from_config(
+        config, torch_dtype=torch_dtype, trust_remote_code=trust_remote_code,
     )
+    # Move to device BEFORE loading weights (avoid CPU OOM)
+    model.to(device)
 
-    # 3. Load ternary params
+    # 3. Load base weights (embed, lm_head, norms) into skeleton
+    base_path = path / "base_model.safetensors"
+    if base_path.exists():
+        from safetensors.torch import load_file
+        base_weights = load_file(str(base_path))
+        # strict=False: base_weights only has unquantized layers + norms
+        missing, unexpected = model.load_state_dict(base_weights, strict=False)
+        if missing:
+            logger.info(f"  {len(missing)} keys not in base_model (ternary layers — expected)")
+        if unexpected:
+            logger.warning(f"  {len(unexpected)} unexpected keys in base_model")
+        logger.info(f"Loaded {len(base_weights)} base tensors (embed, lm_head, norms)")
+    else:
+        logger.warning(f"No base_model.safetensors in {path} — model has random weights")
+
+    # 4. Load ternary params
     ternary_params_path = path / "ternary_params.pt"
     if ternary_params_path.exists():
         ternary_params = torch.load(ternary_params_path, map_location=device,
                                      weights_only=True)
         logger.info(f"Loaded ternary params for {len(ternary_params)} layers")
 
-        # 4. Load LoRA weights if present
+        # 5. Load LoRA weights if present
         lora_weights = {}
         lora_path = path / "lora_weights.safetensors"
         if lora_path.exists():
@@ -181,7 +197,7 @@ def load_ternary_lora(
             lora_weights = load_file(str(lora_path))
             logger.info(f"Loaded {len(lora_weights)} LoRA tensors")
 
-        # 5. Replace target layers with TernaryInferenceLinear
+        # 6. Replace target layers with TernaryInferenceLinear
         _inject_ternary_layers(model, ternary_params, lora_weights, device)
     else:
         logger.warning(f"No ternary_params.pt found in {path} — loaded FP16 model")
