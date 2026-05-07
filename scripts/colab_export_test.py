@@ -163,18 +163,20 @@ device = "cuda" if has_cuda else "cpu"
 dtype = torch.bfloat16 if has_cuda else torch.float32
 
 if _has_ckpt("stage1_base"):
-    model, tokenizer = _load_ckpt("stage1_base", "cpu", dtype)
+    model, tokenizer = _load_ckpt("stage1_base", device, dtype)
     resumed_stages.append("base")
 else:
     config = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
     if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
         config.pad_token_id = 0
 
+    # Load directly to GPU to avoid 5.4 GB CPU RAM occupation.
+    # model.cuda() after CPU load often fails to free the CPU copy.
     model = AutoModelForCausalLM.from_pretrained(
         MODEL,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
-        device_map="cpu",
+        device_map=device,  # "cuda" — never occupies CPU RAM
         trust_remote_code=True,
         config=config,
     )
