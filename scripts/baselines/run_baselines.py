@@ -218,7 +218,10 @@ def baseline_autoround(model_id: str, device: str) -> Optional[dict]:
     t0 = time.time()
 
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_id, config=_safe_config(model_id), torch_dtype="auto")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, config=_safe_config(model_id), torch_dtype="auto",
+            low_cpu_mem_usage=True, device_map="cpu",
+        )
         tokenizer = AutoTokenizer.from_pretrained(model_id)
 
         from datasets import load_dataset
@@ -341,12 +344,21 @@ def baseline_ternaryboost(model_id: str, device: str) -> Optional[dict]:
         from eval.benchmarks import evaluate_model
 
         cfg = _safe_config(model_id)
-        model = AutoModelForCausalLM.from_pretrained(model_id, config=cfg, torch_dtype=torch.float16)
+        # Load student to CPU first (low_cpu_mem_usage=True), then move to GPU.
+        # This avoids the 5.4 GB CPU copy that from_pretrained without the flag creates.
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, config=cfg, torch_dtype=torch.float16,
+            low_cpu_mem_usage=True, device_map="cpu",
+        )
         tokenizer = AutoTokenizer.from_pretrained(model_id)
-        teacher_cfg = _safe_config(model_id)
-        teacher = AutoModelForCausalLM.from_pretrained(model_id, config=teacher_cfg, torch_dtype=torch.float16)
-
         model.to(device)
+
+        # Only then load teacher (also low_cpu_mem_usage) — prevents 10.8 GB CPU peak.
+        teacher_cfg = _safe_config(model_id)
+        teacher = AutoModelForCausalLM.from_pretrained(
+            model_id, config=teacher_cfg, torch_dtype=torch.float16,
+            low_cpu_mem_usage=True, device_map="cpu",
+        )
         teacher.to(device)
 
         # Load calibration texts
@@ -394,7 +406,10 @@ def baseline_fp16(model_id: str, device: str) -> dict:
     """FP16 teacher PPL (upper bound)."""
     logger.info("=== Baseline 0: FP16 teacher ===")
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, config=_safe_config(model_id), torch_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, config=_safe_config(model_id), torch_dtype=torch.float16,
+        low_cpu_mem_usage=True, device_map="cpu",
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model.to(device)
 

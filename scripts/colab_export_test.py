@@ -90,6 +90,7 @@ def _load_ckpt(stage, device, dtype):
     model = AutoModelForCausalLM.from_pretrained(
         str(p), torch_dtype=dtype, device_map=device,
         trust_remote_code=True, config=config,
+        low_cpu_mem_usage=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(str(p), trust_remote_code=True)
     if tokenizer.pad_token is None:

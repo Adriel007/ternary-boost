@@ -224,6 +224,7 @@ def load_ternary_lora(
     model = AutoModelForCausalLM.from_pretrained(
         str(path), torch_dtype=torch_dtype, device_map=device,
         trust_remote_code=trust_remote_code, config=config,
+        low_cpu_mem_usage=True,
     )
 
     # 2. Load ternary params and replace Linear with TernaryInferenceLinear

@@ -271,112 +271,119 @@ class HybridModelConfig:
 
 def load_hybrid_model(
     export_dir: str | Path,
+    device: str = "cpu",
+    torch_dtype=torch.float16,
     config: Optional[HybridModelConfig] = None,
 ) -> nn.Module:
-    """Load exported ternary model into the hybrid runtime.
+    """Load an exported ternary model into the hybrid runtime.
 
-    Reads INT2-packed weights, outlier sidecars, and LoRA adapters from
-    a sharded safetensors export directory (as produced by
-    ``pt_bitnet.export.export_ternary_lora``).
+    Reads the same export format as ``pt_bitnet.export.load_ternary_lora``
+    (HF safetensors + ternary_params.pt + lora_weights.safetensors) and
+    replaces quantized linears with ``HybridTernaryLinear``.
+
+    Outliers are currently *baked into* the INT2-packed weights.  When
+    the Week 5 spike adds separate outlier sidecars to the export format,
+    this loader will pick them up automatically.
 
     Args:
-        export_dir: Path to the export directory containing safetensors shards.
-        config: Hybrid runtime configuration.
+        export_dir: directory containing config.json, ternary_params.pt,
+                    lora_weights.safetensors, and sharded safetensors.
+        device: target device (``"cpu"`` or ``"cuda"``).
+        torch_dtype: dtype for non-ternary parameters.
+        config: hybrid runtime configuration (kernel path, etc.).
 
     Returns:
-        An nn.Module where each quantized linear is a HybridTernaryLinear.
+        Model where each quantized linear is a HybridTernaryLinear.
     """
+    from transformers import AutoModelForCausalLM, AutoConfig
+
     if config is None:
         config = HybridModelConfig()
 
-    import json
-    from safetensors.torch import load_file
-
     export_dir = Path(export_dir)
 
-    # Discover shards
-    shard_files = sorted(export_dir.glob("model-*.safetensors"))
-    if not shard_files:
-        shard_files = sorted(export_dir.glob("*.safetensors"))
+    # 1. Load config + model via HF (low_cpu_mem_usage for safety)
+    hf_config = AutoConfig.from_pretrained(str(export_dir), trust_remote_code=True)
+    if getattr(hf_config, "pad_token_id", None) is None:
+        hf_config.pad_token_id = getattr(hf_config, "eos_token_id", 0) or 0
 
-    # Load metadata (layer map, config)
-    meta_path = export_dir / "model.safetensors.index.json"
-    if meta_path.exists():
-        with open(meta_path) as f:
-            meta = json.load(f)
-    else:
-        meta = {"weight_map": {}}
+    model = AutoModelForCausalLM.from_pretrained(
+        str(export_dir), config=hf_config, torch_dtype=torch_dtype,
+        device_map=device, trust_remote_code=True, low_cpu_mem_usage=True,
+    )
 
-    # Load all shards into CPU memory (size ~2.5 GB for Phi-2, fits T4 CPU RAM)
-    all_tensors: dict[str, torch.Tensor] = {}
-    for sf in shard_files:
-        tensors = load_file(str(sf))
-        all_tensors.update(tensors)
+    # 2. Load ternary params (same format as load_ternary_lora)
+    tp_path = export_dir / "ternary_params.pt"
+    if not tp_path.exists():
+        logger.warning("No ternary_params.pt — returning FP16 model unchanged")
+        return model
 
-    logger.info(f"Loaded {len(all_tensors)} tensors from {len(shard_files)} shard(s)")
+    ternary_params = torch.load(tp_path, map_location=device, weights_only=True)
+    logger.info(f"Loaded ternary params for {len(ternary_params)} layers")
 
-    # Parse components: W_int2, alpha, outliers, LoRA per layer
-    layers: dict[str, dict] = {}
-    for key, tensor in all_tensors.items():
-        # Expected keys: model.layers.N.self_attn.q_proj.weight_int2
-        #               model.layers.N.mlp.fc1.weight_int2
-        #               model.layers.N.self_attn.q_proj.alpha
-        #               model.layers.N.self_attn.q_proj.outliers_weight
-        #               model.layers.N.self_attn.q_proj.outliers_indices
-        #               model.layers.N.self_attn.q_proj.lora_A
-        parts = key.rsplit(".", 1)
-        if len(parts) == 2 and parts[1] in (
-            "weight_int2", "alpha", "bias",
-            "outliers_weight", "outliers_indices",
-            "lora_A", "lora_B", "lora_scaling",
-        ):
-            layer_key = parts[0]
-            attr = parts[1]
-            if layer_key not in layers:
-                layers[layer_key] = {}
-            layers[layer_key][attr] = tensor
+    # 3. Load LoRA weights
+    lora_weights: dict[str, torch.Tensor] = {}
+    lora_path = export_dir / "lora_weights.safetensors"
+    if lora_path.exists():
+        from safetensors.torch import load_file
+        lora_weights = load_file(str(lora_path))
+        logger.info(f"Loaded {len(lora_weights)} LoRA tensors")
 
-    logger.info(f"Parsed {len(layers)} layers from export")
-
-    # Build a flat nn.Module with HybridTernaryLinear layers
-    model = nn.Module()
-    for layer_key, components in sorted(layers.items()):
-        if "weight_int2" not in components or "alpha" not in components:
+    # 4. Replace linears with HybridTernaryLinear
+    replaced = 0
+    for module_name, module in list(model.named_modules()):
+        if module_name not in ternary_params:
             continue
 
-        weight_int2 = components["weight_int2"]
-        alpha = components["alpha"]
-        bias = components.get("bias")
-        outliers_w = components.get("outliers_weight")
-        outliers_idx = components.get("outliers_indices")
-        lora_A = components.get("lora_A")
-        lora_B = components.get("lora_B")
+        tp = ternary_params[module_name]
+        out_f = tp["out_features"]
+        in_f = tp["in_features"]
 
-        # Parse lora_scaling from alpha/rank if not explicit
+        # Build PyTorchTernaryKernel (reference path — swap for llama.cpp / T-MAC later)
+        tern_kernel = PyTorchTernaryKernel(
+            weight_int2=tp["int2_packed"].to(device),
+            alpha=tp["alpha"].to(device),
+            bias=tp["bias"].to(device) if tp.get("bias") is not None else None,
+        )
+
+        # LoRA adapter
+        lora_A = lora_B = None
         lora_scaling = 1.0
-        if "lora_scaling" in components:
-            lora_scaling = components["lora_scaling"].item()
-        elif lora_A is not None and lora_B is not None:
-            rank = lora_A.shape[0]
-            lora_scaling = 128.0 / rank  # default alpha=128
+        if tp.get("has_lora"):
+            lora_A_key = f"{module_name}.lora_A"
+            lora_B_key = f"{module_name}.lora_B"
+            if lora_A_key in lora_weights and lora_B_key in lora_weights:
+                lora_A = lora_weights[lora_A_key].to(device)
+                lora_B = lora_weights[lora_B_key].to(device)
+                lora_scaling = tp.get("lora_scale", 1.0)
 
-        hybrid = build_hybrid_layer(
-            weight_int2=weight_int2,
-            alpha=alpha,
-            bias=bias,
-            outliers_weight=outliers_w,
-            outliers_indices=outliers_idx,
+        # Outliers are currently baked into int2_packed / alpha (see export.py).
+        # When Week 5 adds separate outlier sidecars, load them here.
+        hybrid = HybridTernaryLinear(
+            ternary_kernel=tern_kernel,
+            outliers_weight=None,   # TODO: load from outlier sidecar (Week 5)
+            outliers_indices=None,  # TODO
             lora_A=lora_A,
             lora_B=lora_B,
             lora_scaling=lora_scaling,
-            kernel_path=config.kernel_path,
+            bias=tp["bias"].to(device) if tp.get("bias") is not None else None,
+            out_features=out_f,
+            in_features=in_f,
         )
 
-        # Store as attribute with dots replaced by underscores
-        attr_name = layer_key.replace(".", "_")
-        setattr(model, attr_name, hybrid)
+        # Navigate to parent and replace
+        parts = module_name.rsplit(".", 1)
+        if len(parts) == 1:
+            parent = model
+            child_name = parts[0]
+        else:
+            parent = model.get_submodule(parts[0])
+            child_name = parts[1]
+        setattr(parent, child_name, hybrid)
+        replaced += 1
 
-    logger.info(f"Built {len([m for m in model.modules() if isinstance(m, HybridTernaryLinear)])} hybrid layers")
+    logger.info(f"Replaced {replaced} layers with HybridTernaryLinear")
+    model.eval()
     return model
 
 

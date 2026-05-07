@@ -38,7 +38,7 @@ from transformers import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from shared.logging import get_logger
-from shared.checkpoint import save_checkpoint, load_checkpoint
+from shared.checkpoint import save_training_checkpoint, load_training_checkpoint
 from pt_bitnet.subln import insert_subln, remove_subln, count_subln
 
 logger = get_logger("warmup_subln")
@@ -127,6 +127,7 @@ def warmup_subln(args):
         config.pad_token_id = getattr(config, "eos_token_id", 0) or 0
     model = AutoModelForCausalLM.from_pretrained(
         args.model, config=config, torch_dtype=dtype, trust_remote_code=False,
+        low_cpu_mem_usage=True,
     )
     model.to(device)
 
@@ -173,12 +174,10 @@ def warmup_subln(args):
     start_step = 0
     total_tokens_seen = 0
     if args.resume:
-        checkpoint = load_checkpoint(args.output)
-        if checkpoint is not None:
-            model.load_state_dict(checkpoint["model_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            start_step = checkpoint.get("step", 0)
-            total_tokens_seen = checkpoint.get("tokens_seen", 0)
+        state = load_training_checkpoint(args.output, model, optimizer, scheduler)
+        start_step = state["step"]
+        total_tokens_seen = state["tokens_seen"]
+        if start_step > 0:
             logger.info(f"Resumed from step {start_step} ({total_tokens_seen:,} tokens)")
 
     # ── C4 data stream ───────────────────────────────────────────
@@ -275,23 +274,19 @@ def warmup_subln(args):
 
         # ── Checkpoint ────────────────────────────────────────────
         if step % args.checkpoint_steps == 0:
-            save_checkpoint(
+            save_training_checkpoint(
                 args.output,
-                model_state_dict=model.state_dict(),
-                optimizer_state_dict=optimizer.state_dict(),
-                step=step,
-                tokens_seen=total_tokens_seen_local,
+                model=model, optimizer=optimizer, scheduler=scheduler,
+                step=step, tokens_seen=total_tokens_seen_local,
             )
             logger.info(f"Checkpoint saved at step {step} ({total_tokens_seen_local:,} tokens)")
 
     # ── Final save ────────────────────────────────────────────────
     os.makedirs(args.output, exist_ok=True)
-    save_checkpoint(
+    save_training_checkpoint(
         args.output,
-        model_state_dict=model.state_dict(),
-        optimizer_state_dict=optimizer.state_dict(),
-        step=step,
-        tokens_seen=total_tokens_seen_local,
+        model=model, optimizer=optimizer, scheduler=scheduler,
+        step=step, tokens_seen=total_tokens_seen_local,
     )
 
     elapsed_m = (time.time() - t_start) / 60
