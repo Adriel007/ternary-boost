@@ -399,7 +399,13 @@ def _symmetric_ternary(
     best_result = torch.zeros_like(w)
     cw = col_weights.unsqueeze(0)  # [1, in_f]
 
-    B = 16  # batch size: balance VRAM vs kernel launch count
+    # Adaptive batch size: limit peak 3D intermediate to ~500 MB.
+    # For the largest Phi-2 layer (fc2: 10240×2560), a single
+    # float32 [out_f, B, in_f] = out_f × B × in_f × 4 bytes.
+    # Targeting ≤ 500 MB → B ≤ 500×2²⁰ / (out_f × in_f × 4).
+    max_bytes_per_batch = 500 * 1024 * 1024  # 500 MB
+    bytes_per_candidate = out_f * in_f * 4   # one float32 slice
+    B = max(1, min(16, max_bytes_per_batch // bytes_per_candidate))
     n_cand = candidate_indices.size(0)
 
     for batch_start in range(0, n_cand, B):
