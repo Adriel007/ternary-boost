@@ -180,35 +180,64 @@ def finetune_lora(
     logger.info(f"  LoRA trainable params: {total_lora:,} "
                 f"({total_lora * 4 / 1e6:.1f} MB fp32)")
 
-    # ── Phase 1: Pre-compute teacher logits on CPU ───────────────
-    # Teacher stays on CPU the entire time. Student stays on GPU.
-    # No model transfers = no memory leaks. CPU forward is ~0.5s/text.
+    # ── Phase 1: Pre-compute teacher logits (GPU batched) ────────
+    # Teacher runs on GPU in batches of 8 for speed, logits cached
+    # on CPU. Student stays on GPU. Peak VRAM: student + teacher
+    # ≈ 11 GB for Phi-2 — fits T4 15.6 GB with margin.
     teacher_logits_cache = []
     if teacher_model is not None:
         teacher_model.eval()
         for p in teacher_model.parameters():
             p.requires_grad = False
-        # Teacher stays on CPU — no GPU memory impact
-        teacher_model.cpu()
+
+        TEACHER_BATCH = 8  # texts per GPU forward
+        n_texts = len(calibration_texts)
+
+        # Right-padding is critical: the student processes texts one at a
+        # time (no padding), so position IDs start at 0. Left-padding would
+        # shift real tokens to higher positions, breaking KD alignment.
+        _pad_side = tokenizer.padding_side
+        tokenizer.padding_side = "right"
+
         if has_cuda:
+            teacher_model.to(device)
             torch.cuda.empty_cache()
+            logger.info("  Pre-computing teacher logits on GPU "
+                        f"(batch={TEACHER_BATCH}, {n_texts} texts)...")
+        else:
+            logger.info("  Pre-computing teacher logits on CPU "
+                        f"({n_texts} texts)...")
 
-        logger.info("  Pre-computing teacher logits on CPU (~0.5s per text)...")
-        for i, text in enumerate(calibration_texts):
-            inputs = tokenizer(text, return_tensors="pt", truncation=True,
-                               max_length=config.max_seq_length)
-            # Teacher forward on CPU
-            with torch.no_grad():
+        with torch.no_grad():
+            for batch_start in range(0, n_texts, TEACHER_BATCH):
+                batch_end = min(batch_start + TEACHER_BATCH, n_texts)
+                batch_texts = calibration_texts[batch_start:batch_end]
+
+                inputs = tokenizer(
+                    batch_texts, return_tensors="pt", truncation=True,
+                    max_length=config.max_seq_length, padding=True,
+                )
+                if has_cuda:
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+
                 out = teacher_model(input_ids=inputs["input_ids"])
-            teacher_logits_cache.append(out.logits.detach())  # stays on CPU
-            del out
+                # Split batch outputs into per-text logits on CPU.
+                # Slice to real token count (exclude padding) so position
+                # IDs and sequence lengths match the student's view.
+                for j in range(len(batch_texts)):
+                    sample_len = (inputs["attention_mask"][j] == 1).sum().item()
+                    logits_j = out.logits[j, :sample_len].detach().cpu()
+                    teacher_logits_cache.append(logits_j)
+                del out, inputs
 
-            cache_mb = sum(t.numel() * 2 for t in teacher_logits_cache) / 1e6
-            if (i + 1) % max(1, len(calibration_texts) // 5) == 0:
-                logger.info(f"    Cached {i + 1}/{len(calibration_texts)} "
-                            f"teacher logits ({cache_mb:.0f} MB CPU RAM)")
+                cache_mb = sum(t.numel() * 2 for t in teacher_logits_cache) / 1e6
+                if (batch_end) % max(1, n_texts // 5) == 0 or batch_end == n_texts:
+                    logger.info(f"    Cached {batch_end}/{n_texts} "
+                                f"teacher logits ({cache_mb:.0f} MB CPU RAM)")
 
-        # Free teacher (was on CPU, no GPU impact)
+        tokenizer.padding_side = _pad_side  # restore
+
+        # Free teacher from GPU/CPU
         del teacher_model
         gc.collect()
         if has_cuda:
@@ -226,6 +255,7 @@ def finetune_lora(
                                     for t in teacher_logits_cache]
             gpu_mb = sum(t.numel() * t.element_size()
                         for t in teacher_logits_cache) / 1e6
+            _log_vram("  VRAM with teacher logits cache")
             logger.info(f"  Moved teacher logits to GPU ({gpu_mb:.0f} MB)")
     else:
         logger.info("  No teacher — using CE loss only (no distillation)")
