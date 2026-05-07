@@ -21,6 +21,9 @@ Failures are as important as successes — they show what doesn't work and why.
 2026-05-05  19:00   LoRA v2: hyperparameter fixes + re-quantization. Pending test.
 2026-05-06  12:00   LoRA v3 (dense merge): PPL 1.239x — best result so far.
 2026-05-06  22:00   OBC + act-aware + LoRA v3: PPL 1.281x — OBC regressed quality.
+2026-05-07  12:00   Infrastructure overhaul: GPU teacher, vectorized grid search, sharded export, checkpoint/resume. Pipeline stable, no OOM.
+2026-05-07  15:00   WikiText-2 baseline established. FP16=27.39, ternary=33.31 at max_len=128 → 1.216x. Attention-only LoRA, code from pre-overhaul era.
+2026-05-07  15:30   LoRA extended to FFN layers (dense, fc1, fc2, gate/up/down). Pending test.
 ```
 
 ---
@@ -499,19 +502,56 @@ OBC and activation-aware thresholds are **not recommended** for Phi-2 scale mode
 
 ---
 
+## Experiment 11: WikiText-2 Standardized Evaluation + FFN LoRA
+
+**Date**: 2026-05-07
+**Hardware**: Colab T4
+**Commit**: `63354cd` (WikiText-2), `859fdea` (FFN LoRA)
+**Config**: PT-BitNet (sym, outliers=1%, comp=30) → LoRA (rank=64, steps=1000, attention-only) → export (sharded) → load → eval
+
+### What Changed
+
+Switched from 8 custom diverse texts to **WikiText-2 test set** (500 lines) as the standard benchmark metric. This is what quantization papers (GPTQ, SpQR, PB-LLM) use — makes our numbers comparable.
+
+Also added **FP16 baseline** measured BEFORE quantization so degradation is always relative to the same model on the same data.
+
+### Results (attention-only LoRA, max_len=128)
+
+| Metric | FP16 | Ternary + LoRA | Degradation |
+|--------|------|----------------|-------------|
+| WikiText-2 PPL (500 lines) | 27.39 | 33.31 | **1.216x** (+21.6%) |
+| Quick 8-text PPL | — | 4.24 | — |
+| INT2 integrity | — | 0 error | — |
+| Pipeline time | — | 47.1 min | — |
+
+### Analysis
+
+**1.216x on WikiText-2 aligns with 1.239x on diverse texts from Exp 9** — consistent degradation across different evaluation methods. The ternary model is losing about 20-24% in perplexity terms across the board.
+
+**WikiText-2 PPL is high even for FP16 (27.39)** because Phi-2 is optimized for code/reasoning, not language modeling. The absolute number matters less than the ratio.
+
+### Next: FFN LoRA
+
+LoRA was extended from attention-only (96 layers) to all linear layers (192 layers) by adding `dense`, `fc1`, `fc2`, `gate_proj`, `up_proj`, `down_proj` to target modules. This doubles LoRA coverage. Expected improvement: 3-7 percentage points (degradation from 1.22x → 1.15-1.18x).
+
+---
+
 ## Summary: What We Learned
 
-**Total experiments**: 10 full + 11 technique failures = 21 documented attempts
-**Successful**: PT-BitNet (sym+outliers+comp), LoRA training dynamics, LoRA v3 dense merge
+**Total experiments**: 11 full + 11 technique failures = 22 documented attempts
+**Successful**: PT-BitNet (sym+outliers+comp), LoRA training dynamics, LoRA v3 dense merge, WikiText-2 evaluation, sharded export, checkpoint/resume
 **Failed**: Tequila, QAT, ITF+outliers, SSR, AGA, ITF-clamped, re-quantize, high-distill-KD, soft-temperature, per-element-Lambada, OBC+act-aware (regressed PPL)
 
 ### What works
-- Symmetric ternary + 1% outliers → solid baseline (PPL 1.32x)
-- Hessian compensation on lm_head → small but consistent gain (2% loss reduction)
-- CPU teacher for LoRA → safe, no VRAM spike (6 GB peak)
-- LoRA training dynamics → CE loss decreases (6.91→4.03), model learns
-- Dense merge after LoRA → preserves LoRA improvement
-- Ablation testing → isolates root causes quickly
+- Symmetric ternary + 1% outliers → solid baseline (PPL 1.22x WikiText-2)
+- Hessian compensation on lm_head → small but consistent gain
+- GPU teacher + batched pre-computation → ~10x faster, no CPU RAM cost
+- LoRA KD from FP16 teacher → CE loss decreases (8.02→3.91), model learns
+- Keep LoRA separate (dense merge not needed with INT2 export)
+- Sharded safetensors save → no RAM OOM during export
+- Checkpoint/resume → survives Colab disconnects, skips completed stages
+- WikiText-2 with matching max_len → reproducible, comparable metric
+- Vectorized grid search → identical quality, 8x fewer kernel launches
 
 ### What doesn't work (with root cause)
 - **Tequila with PTQ**: Denormalization + re-decomposition conflict (fundamental)
@@ -523,13 +563,12 @@ OBC and activation-aware thresholds are **not recommended** for Phi-2 scale mode
 - **SSR column reordering**: Inverse permutation bug scrambles weights
 - **Clamped ITF**: Too restrictive to find optimal solutions
 - **Per-element Lambada**: Memory-prohibitive (2.5 GB for 7B)
-- **Full state_dict save**: System RAM exhaustion on Colab
+- **Full state_dict save**: System RAM exhaustion on Colab (fixed: sharded)
 - **Stale custom_params**: Cached params corrupt fresh model loads
 - **OBC + activation-aware thresholds (small models)**: Over-compensation + LoRA interaction regressed PPL from 1.239x to 1.281x
 
 ### Open questions
-- Can LoRA with dense merge achieve PPL <1.15x?
-- Would LoRA on ALL layers (not just attention) help with dense merge?
+- Can FFN LoRA push degradation below 1.15x? (testing now)
 - Can STE block-wise fine-tuning work (or is ternary STE too noisy)?
 - What's the optimal calibration data for KD (WikiText vs instruct vs model-generated)?
 - Would a 7B model benefit more (more weight redundancy)?

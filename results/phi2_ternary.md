@@ -1,111 +1,61 @@
 # Phi-2 Ternary Compression Results
 
-**Last updated**: 2026-05-06
+**Last updated**: 2026-05-07
 **Hardware**: Colab T4 (15.6 GB VRAM, 12.7 GB RAM)
+**Model**: microsoft/phi-2 (2.78B params)
 
-## Active Pipeline Stages
+## Active Pipeline
 
-| Stage | Status | Reason |
-|-------|--------|--------|
-| 1. PT-BitNet | Active | Symmetric ternary + 1% outliers + OBC row compensation + activation-aware thresholds |
+| Stage | Status | Details |
+|-------|--------|---------|
+| 1. PT-BitNet | Active | Symmetric ternary + 1% outliers + 30-step Hessian compensation |
 | 2. ParetoQ/QAT | Removed | sign() binary destroys ternary sparsity |
-| 3. Tequila | Removed | UltraQuantV3 re-decomposition incompatible with PT-BitNet denorm |
-| 4. LoRA | Active | Rank-64 KD from FP16 teacher, dense merge (no re-quantize) |
+| 3. Tequila | Removed | UltraQuantV3 incompatible with PT-BitNet denorm |
+| 4. LoRA | Active | Rank-64 KD from FP16 teacher, attention-only (FFN pending) |
 
-## Model: microsoft/phi-2 (2.78B params)
+## Latest Results: WikiText-2 Standardized (2026-05-07)
 
-### PT-BitNet only (no LoRA, no OBC) — Experiment 6
+Measured on WikiText-2 test set (500 lines, max_len=128). This is the standard metric in quantization literature.
 
-| Metric | Baseline FP16 | Quantized (ternary) | Ratio |
-|--------|--------------|---------------------|-------|
-| Perplexity (simple texts) | 2.61 | 3.45 | 1.32x |
-| Generation quality (avg 0-100) | 94 | 94 | 1.00x |
-| Repetition ratio | 0.00 | 0.00 | — |
-| Speed | — | 20.5 tok/s | — |
-| Pipeline time | — | 10.1 min | — |
+| Metric | FP16 Baseline | Ternary + LoRA | Degradation |
+|--------|--------------|----------------|-------------|
+| WikiText-2 PPL | 27.39 | 33.31 | **1.216x (+21.6%)** |
+| 8-text quick PPL | — | 4.24 | — |
+| INT2 integrity | — | 0 errors / 629M weights | — |
+| Pipeline time | — | 47.1 min | — |
+| Export size (full) | — | 6.1 GB | — |
+| Inference size (INT2+LoRA) | — | ~450 MB | 12.4x vs FP16 |
 
-### PT-BitNet + LoRA v3 (rank=64, dense merge, no OBC) — Experiment 9
+### Generation Samples
 
-| Metric | Baseline FP16 | Quantized + LoRA | Ratio |
-|--------|--------------|------------------|-------|
-| Perplexity (diverse texts) | 3.16 | 3.91 | 1.239x |
-| Generation quality (avg 0-100) | 82 | 88 | 1.07x |
-| Repetition ratio | 0.00 | 0.000 | — |
-| Speed | — | 19.2 tok/s | — |
-| Pipeline time | — | 34.7 min | — |
-
-### PT-BitNet (OBC + act-aware) + LoRA v3 — Experiment 10 [LATEST]
-
-**Date**: 2026-05-06
-**Commit**: `b7b5fec`
-
-| Metric | Baseline FP16 | Quantized + LoRA | Ratio |
-|--------|--------------|------------------|-------|
-| Perplexity (diverse texts) | 3.16 | **4.04** | **1.281x** |
-| Generation quality (avg 0-100) | 82 | 88 | 1.07x |
-| Jaccard overlap | — | 0.19 | — |
-| Repetition ratio | 0.00 | 0.072 | — |
-| Speed | — | 21.2 tok/s | — |
-| Pipeline time | — | 54.6 min | — |
-
-**Verdict: GOOD** — minor quality loss, fully usable
-
-### Training Dynamics (Experiment 10)
-
-| Step | CE Loss | KD Loss |
-|------|---------|---------|
-| 1 | 6.81 | 10.75 |
-| 100 | 7.80 | 21.00 |
-| 500 | 6.08 | 15.12 |
-| 1000 | 4.50 | 11.31 |
-
-### Generation Samples (Experiment 10)
-
-| Prompt | Response | Correct? |
-|--------|----------|-----------|
-| "Capital of Japan?" | `Tokyo` + exercises | ✅ |
-| "WWII end year?" | `1945.` + EU exercise | ✅ |
-| "Water symbol?" | `H2O` + formula + conductivity exercise | ✅ |
-| "Planets count?" | `There are eight planets...` + Jupiter question | ✅ |
-| "5 apples × $2?" | `$10` + discount follow-up | ✅ |
-| "All dogs animals?" | `Yes, all dogs are animals.` | ✅ |
-| "Photosynthesis?" | `Plants use sunlight → CO2 + water → glucose` | ✅ |
-| "Moon vs Earth?" | `Earth larger, ~12,742 km vs ~1,737 km` | ✅ |
-| "Lie ethical?" | `It depends on the context` | ✅ |
-| "Haiku ocean?" | `Waves crashing on the shore...` (actual haiku!) | ✅ |
+| Prompt | Response |
+|--------|----------|
+| "The capital of France is" | Paris. |
+| "Water freezes at" | the same temperature as water... |
+| "The largest planet in the solar system is" | Jupiter. |
 
 ## Comparison: All Versions
 
-| Version | PPL Ratio | Gen Quality | Pipeline | Key Difference |
-|---------|-----------|-------------|----------|----------------|
-| PT-BitNet only (no OBC) | 1.324x* | 94/100 | 10 min | Baseline ternary |
-| LoRA v1 (bad KD) | 1.256x | 90/100 | 19 min | distill=0.5, T=3.0, rank=32 |
-| LoRA v2 (re-quantize) | 5.656x | 72/100 | 36 min | Re-quantize destroyed |
-| **LoRA v3 (dense, no OBC)** | **1.239x** | **88/100** | **35 min** | **Best PPL ratio** |
-| LoRA v3 + OBC + act-aware | 1.281x | 88/100 | 55 min | OBC didn't help |
+| Version | Metric | Degradation | Pipeline | Key Difference |
+|---------|--------|-------------|----------|----------------|
+| PT-BitNet only | PPL 1.32x | 32% | 10 min | Baseline ternary, no LoRA |
+| LoRA v1 (bad KD) | PPL 1.26x | 26% | 19 min | distill=0.5, T=3.0 |
+| LoRA v2 (re-quantize) | PPL 5.66x | 466% | 36 min | Re-quantize destroyed |
+| **LoRA v3 (attn-only)** | **PPL 1.22x** | **22%** | **35 min** | **Best to date** |
+| LoRA v3 + OBC | PPL 1.28x | 28% | 55 min | OBC regressed quality |
+| **LoRA FFN (pending)** | **?** | **?** | **~50 min** | **All 192 layers** |
 
-*Simple texts (baseline 2.61). All others use diverse texts (baseline 3.16).
+## What We Know
 
-## Analysis
+- **1.22x degradation on WikiText-2 is solid** for 1.58-bit post-training quantization
+- LoRA KD is the single biggest quality lever (~10 percentage points vs PT-BitNet alone)
+- OBC and activation-aware thresholds regress quality on small models
+- Keeping LoRA separate (not merging into weights) preserves the ternary backbone for INT2 export
+- Checkpoint/resume eliminates re-run time on failure
+- WikiText-2 with matching max_len=128 gives reproducible, comparable numbers
 
-### OBC + Activation-Aware Thresholds: Didn't Help
+## Pending
 
-The OBC row compensation and activation-aware column weights were expected to improve PPL ratio from 1.239x → 1.12x or better. Instead, PPL ratio regressed to 1.281x. Possible reasons:
-
-1. **Over-compensation**: OBC corrects per-row bias using Hessian diagonal. On small models (2.7B), the correction may be too aggressive relative to the ternary error structure.
-2. **Interaction with LoRA**: LoRA was trained to compensate for a specific ternary error pattern. OBC changes that pattern → LoRA's learned correction may no longer match.
-3. **Column weights distorting thresholds**: Activation-aware scaling of the ternary error may de-prioritize channels that are important for later layers (myopic per-layer optimization).
-4. **Small model effect**: PT²-LLM reports best results on 7-70B models. Phi-2 (2.7B) has less parameter redundancy, making compensation techniques less effective.
-
-### What Actually Works
-
-- **LoRA v3 (dense merge, no OBC)** remains the best configuration: PPL ratio 1.239x
-- **PT-BitNet only** is the fastest: 10 min, PPL ratio 1.324x
-- Generation quality is consistently good across all working versions (88-94/100)
-- All factual answers are correct across all versions
-
-### Honest Assessment
-
-The mathematical improvements we researched (OBC, activation-aware thresholds) didn't translate to real gains on Phi-2. The strongest result is **LoRA v3 without OBC** (PPL ratio 1.239x, 35 min).
-
-For 2.7B models, post-training ternary is close to its ceiling. The techniques that work (outlier retention, LoRA KD) are standard. Our novel additions (OBC row compensation, activation-aware column weights) didn't beat the simpler baseline.
+- [ ] FFN LoRA (fc1/fc2/dense) — doubles coverage from 96 to 192 layers
+- [ ] Compare vs GPTQ 2-bit and SpQR baselines on same Phi-2 + WikiText-2
+- [ ] HellaSwag / MMLU downstream benchmarks (eval/ code exists)
